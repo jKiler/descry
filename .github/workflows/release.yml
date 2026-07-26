@@ -19,8 +19,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: make check
@@ -39,15 +39,15 @@ jobs:
       GOARCH: ${{ matrix.goarch }}
       CGO_ENABLED: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Build
         run: go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o descry ./cmd/descry
       - name: Package
         run: tar -czf "descry_${GITHUB_REF_NAME#v}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" descry LICENSE NOTICE README.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: descry_${{ matrix.goos }}_${{ matrix.goarch }}
           path: "*.tar.gz"
@@ -59,7 +59,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - name: Checksums
