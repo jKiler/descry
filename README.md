@@ -9,6 +9,8 @@ a sentence-transformer model, and serves **hybrid retrieval** — dense vector
 search fused with BM25 lexical search — over a persistent SQLite index. It also
 builds a Go call/dependency graph for impact and trace queries.
 
+![descry cold start: it asks before indexing, embeds the repo with live progress, answers a natural-language query with ranked file:line results, then answers a second query instantly from the warm index](demo.gif)
+
 - **Hybrid retrieval** — vector (all-MiniLM-L6-v2) + BM25, fused with Reciprocal
   Rank Fusion. Semantic recall plus exact-identifier precision.
 - **Indexed and fast at scale** — a persisted BM25 inverted index and an int8

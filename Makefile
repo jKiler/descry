@@ -9,7 +9,7 @@ PKG    := ./cmd/descry
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build install test vet fmt fmt-check tidy check clean skill skill-check
+.PHONY: help build install test vet fmt fmt-check tidy check clean skill skill-check demo
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -41,6 +41,9 @@ skill: ## Regenerate skills/descry/SKILL.md from internal/skill
 
 skill-check: ## Fail if the committed skill drifted from internal/skill
 	go run ./cmd/genskill --check
+
+demo: build ## Regenerate the README demo.gif from demo.tape (needs vhs)
+	vhs demo.tape
 
 check: fmt-check vet skill-check test ## Run fmt-check, vet, skill-check, and tests (CI gate)
 
