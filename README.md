@@ -1,6 +1,7 @@
 # descry
 
 [![ci](https://github.com/jKiler/descry/actions/workflows/ci.yml/badge.svg)](https://github.com/jKiler/descry/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/jKiler/descry)](https://github.com/jKiler/descry/releases)
 
 > **descry** *(v.)* — to catch sight of something distant or difficult to discern.
 
