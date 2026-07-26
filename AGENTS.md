@@ -34,6 +34,10 @@ library and model auto-provision on first use.
   `TestSearchGuidanceSharedWithSkill` (`internal/mcp/guidance_test.go`). Change
   guidance in `internal/skill` and let the surfaces render it; don't fork the
   wording per surface.
+- The CLI is verb-first: any argument that is not a reserved subcommand is a
+  search query (`parseArgs` in `cmd/descry/main.go`). Adding a subcommand name
+  is therefore a breaking change for one-word queries — extend the
+  `subcommands` set deliberately, and never prompt when stdin is not a TTY.
 - Retrieval defaults (`RRFK`, `VecWeight`, `LexWeight`, `LexFileWeight`,
   `FuseAlpha`, `CandMult` in `search.NewHybrid`) are the kubernetes-120 sweep
   optimum. Don't change them without re-running `descry eval` on an external

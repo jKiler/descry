@@ -5,6 +5,7 @@ go 1.26.2
 require (
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/yalue/onnxruntime_go v1.31.0
+	golang.org/x/term v0.45.0
 	golang.org/x/text v0.40.0
 	golang.org/x/tools v0.48.0
 	modernc.org/sqlite v1.53.0

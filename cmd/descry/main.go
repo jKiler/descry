@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/jKiler/descry/internal/chunk"
 	"github.com/jKiler/descry/internal/embed"
 	"github.com/jKiler/descry/internal/eval"
@@ -28,28 +30,29 @@ import (
 const version = "0.1.0"
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
-	switch os.Args[1] {
+	inv := parseArgs(os.Args[1:])
+	switch inv.cmd {
+	case cmdHome:
+		runHome(".")
+	case cmdQuery:
+		runQuery(".", inv.query)
 	case "index":
 		dir := "."
-		if len(os.Args) > 2 {
-			dir = os.Args[2]
+		if len(inv.args) > 0 {
+			dir = inv.args[0]
 		}
 		runIndex(dir)
 	case "status":
 		runStatus(".")
 	case "search":
-		if len(os.Args) < 3 {
+		if len(inv.args) == 0 {
 			fmt.Fprintln(os.Stderr, "usage: descry search <query>")
 			os.Exit(2)
 		}
-		runSearch(".", strings.Join(os.Args[2:], " "))
+		runSearch(".", strings.Join(inv.args, " "))
 	case "graph":
 		dir, mode := ".", "auto"
-		for _, a := range os.Args[2:] {
+		for _, a := range inv.args {
 			switch a {
 			case "--typed":
 				mode = "typed"
@@ -62,31 +65,79 @@ func main() {
 		runGraph(dir, mode)
 	case "eval":
 		set := "eval_queries.json"
-		if len(os.Args) > 2 {
-			set = os.Args[2]
+		if len(inv.args) > 0 {
+			set = inv.args[0]
 		}
 		runEval(".", set)
 	case "skill":
 		sub := ""
-		if len(os.Args) > 2 {
-			sub = os.Args[2]
+		if len(inv.args) > 0 {
+			sub = inv.args[0]
 		}
 		runSkill(sub)
 	case "mcp":
 		// An explicit root pins the server to one repository. Left empty, the
 		// server follows whichever project the client has open (MCP roots).
 		root := os.Getenv("DESCRY_ROOT")
-		if len(os.Args) > 2 {
-			root = os.Args[2]
+		if len(inv.args) > 0 {
+			root = inv.args[0]
 		}
 		runMCP(root)
-	case "-h", "--help", "help":
+	case cmdHelp:
 		usage()
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+	default: // cmdUsage — an unknown flag or an empty query
 		usage()
 		os.Exit(2)
 	}
+}
+
+// The verb-first dispatch: bare `descry` reports (or offers to build) the
+// current repository's index, and any argument that isn't a subcommand is a
+// search query — `descry how is auth implemented` just answers. The cost of
+// that convenience is that subcommand names are reserved words: adding a new
+// one is a breaking change for single-word queries, and `descry search <word>`
+// is the escape hatch for querying a reserved word itself.
+const (
+	cmdHome  = "\x00home"  // bare `descry`
+	cmdQuery = "\x00query" // free-text search
+	cmdHelp  = "\x00help"
+	cmdUsage = "\x00usage" // bad usage: unknown flag, empty query
+)
+
+// subcommands are the reserved first arguments that dispatch as commands
+// rather than being read as a query.
+var subcommands = map[string]bool{
+	"index": true, "status": true, "search": true, "graph": true,
+	"eval": true, "mcp": true, "skill": true,
+}
+
+// invocation is one parsed command line.
+type invocation struct {
+	cmd   string   // a subcommand name, or one of the cmd* sentinels
+	args  []string // the subcommand's remaining arguments
+	query string   // the joined free-text query when cmd == cmdQuery
+}
+
+// parseArgs classifies the command line. Pure and total, so it is unit-testable
+// apart from the side-effecting run* handlers.
+func parseArgs(args []string) invocation {
+	if len(args) == 0 {
+		return invocation{cmd: cmdHome}
+	}
+	first := args[0]
+	switch {
+	case subcommands[first]:
+		return invocation{cmd: first, args: args[1:]}
+	case first == "help" || first == "-h" || first == "--help":
+		return invocation{cmd: cmdHelp}
+	case strings.HasPrefix(first, "-"):
+		return invocation{cmd: cmdUsage}
+	}
+	query := strings.TrimSpace(strings.Join(args, " "))
+	if query == "" {
+		return invocation{cmd: cmdUsage}
+	}
+	return invocation{cmd: cmdQuery, query: query}
 }
 
 // indexDirName is the per-repository directory holding the index and the embed
@@ -396,6 +447,91 @@ func runSkill(sub string) {
 	}
 }
 
+// runHome is bare `descry`: a one-screen home view for a warm repository, and
+// an offer to index a cold one. It never indexes without consent — on a
+// non-interactive stdin it only reports and hints.
+func runHome(dir string) {
+	if !indexExists(dir) {
+		if !stdinIsTTY() {
+			fmt.Printf("no index at %s — run `descry index` to build one\n", dbPathFor(dir))
+			return
+		}
+		if !confirmIndex(dir) {
+			fmt.Fprintln(os.Stderr, "not indexing — run `descry index` when ready")
+			return
+		}
+		runIndex(dir)
+		return
+	}
+
+	p, s, err := openPipeline(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open error:", err)
+		os.Exit(1)
+	}
+	defer s.Close()
+	fmt.Printf("%d chunks indexed in %s\n", s.Len(), dbPathFor(dir))
+	fmt.Printf("embedder: %s\n", p.Emb.ID())
+	fmt.Printf("\ntry: descry \"where is auth handled\"\n")
+}
+
+// runQuery is the verb itself: `descry <anything not a subcommand>` searches.
+// A cold repository asks for consent first (TTY) or explains how to index
+// (non-interactive), so a query can never silently start a long index build.
+func runQuery(dir, query string) {
+	if !indexExists(dir) {
+		if !stdinIsTTY() {
+			fmt.Fprintf(os.Stderr, "no index at %s — run `descry index` first\n", dbPathFor(dir))
+			os.Exit(1)
+		}
+		if !confirmIndex(dir) {
+			fmt.Fprintln(os.Stderr, "not indexing — run `descry index` when ready")
+			os.Exit(1)
+		}
+		// Consent given: fall through — readyHybrid builds the index, then the
+		// same run answers the query.
+	}
+	runSearch(dir, query)
+}
+
+// indexExists reports whether dir already has an index database. Checked
+// before openPipeline on the consent paths because opening creates the
+// .descry directory and an empty database as a side effect.
+func indexExists(dir string) bool {
+	_, err := os.Stat(dbPathFor(dir))
+	return err == nil
+}
+
+// stdinIsTTY reports whether stdin is an interactive terminal — the gate for
+// ever prompting. Pipes, redirects, and agent harnesses must get plain output,
+// never a hanging question. This must be a real isatty check: a ModeCharDevice
+// test wrongly passes for /dev/null, which would hang the prompt on a script's
+// closed stdin.
+func stdinIsTTY() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// confirmIndex asks, on the terminal, whether to index dir. The prompt names
+// the absolute directory so it is always clear what is about to be walked —
+// the guard against accidentally indexing a home directory. Default is yes.
+func confirmIndex(dir string) bool {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	fmt.Fprintf(os.Stderr, "descry: no index in %s — index it now? [Y/n] ", abs)
+	var answer string
+	if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil && err.Error() != "unexpected newline" {
+		return false // EOF or a read error is a "no", never a default-yes
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "", "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 func runStatus(root string) {
 	dbPath := dbPathFor(root)
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -626,9 +762,11 @@ func usage() {
 	fmt.Println(`descry — a local hybrid (vector + BM25) code search index
 
 usage:
+  descry                 this repo's index status; offers to build a missing index
+  descry <query>         search this repo (quotes optional); a cold repo asks first
   descry index [dir]     walk dir, chunk + embed + store (default ".")
   descry status          report how many chunks are indexed
-  descry search <query>  hybrid (vector + BM25) search over the current dir
+  descry search <query>  explicit search; indexes a cold repo without asking (script-friendly)
   descry graph [dir] [--typed|--named]  print the call graph as Mermaid (default: typed, falls back to name-based)
   descry eval [queryset.json]   score retrieval (Recall@k, MRR) vs a labeled set
   descry mcp [dir]       serve over MCP (JSON-RPC on stdio); without dir, follows

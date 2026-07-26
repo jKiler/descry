@@ -25,12 +25,14 @@ Preferred — the descry MCP tools, if the `descry` MCP server is connected:
 CLI fallback when MCP is not available:
 
 ```sh
-descry search "<query>"    # run from the repository root
+descry "<query>"    # run from the repository root
 ```
 
-A repository indexes itself on first use. A cold large repository takes minutes;
-MCP calls never block on it — they return progress and ask you to retry in a few
-seconds. Do exactly that instead of giving up on the tool.
+On a repository with no index yet, non-interactive runs exit with instructions
+instead of indexing — run `descry index` once, then query. Via MCP,
+indexing starts automatically in the background: calls return progress and ask
+you to retry in a few seconds — do exactly that instead of giving up on the
+tool (a cold large repository takes minutes).
 
 ## Writing queries
 

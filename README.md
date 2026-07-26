@@ -54,12 +54,17 @@ A `Makefile` wraps the common developer tasks — run `make help` to list them
 
 ```bash
 # Index the current repository (downloads the ~90MB model on first run).
+# The verb: any argument that isn't a subcommand is a search query.
+# On a repo with no index, descry shows the directory and asks before indexing.
+descry "where is auth handled"
+descry how is auth implemented        # quotes optional
+
+# Bare `descry` shows this repo's index status (or offers to build it).
+descry
+
+# The explicit forms, for scripts: index / status / search without prompts.
 descry index .
-
-# How many chunks are indexed?
 descry status
-
-# Hybrid search.
 descry search "where is auth handled"
 
 # Print the Go call graph as Mermaid (typed by default; --named forces the heuristic).
@@ -75,8 +80,10 @@ descry mcp
 descry skill install
 ```
 
-The first `search` builds the index if it doesn't exist; later runs reuse it.
-Indexing shows a progress bar on stderr.
+A query against a cold repository asks for consent (naming the directory) and
+then indexes and answers in one run; non-interactive runs never prompt or
+silently index — they exit with the `descry index` hint instead. Later runs
+reuse the persisted index. Indexing shows a progress bar on stderr.
 
 ### MCP
 

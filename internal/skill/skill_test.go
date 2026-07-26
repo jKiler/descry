@@ -25,7 +25,8 @@ func TestMarkdownShape(t *testing.T) {
 	// The body must teach every MCP tool and the CLI fallback.
 	for _, want := range []string{
 		"`search`", "`read_relevant`", "`graph_impact`", "`graph_trace`", "`status`",
-		"descry search \"<query>\"",
+		"descry \"<query>\"",
+		"descry index",
 		SearchWhen,
 	} {
 		if !strings.Contains(md, want) {
