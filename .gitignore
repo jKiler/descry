@@ -1,0 +1,12 @@
+# IDE / OS
+.idea
+.DS_Store
+
+# Local index + embed cache written by `descry index`
+.descry/
+
+# Build artifacts
+/descry
+
+# Generated graph output (`descry graph > *.mmd`)
+*.mmd

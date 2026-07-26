@@ -1,0 +1,638 @@
+// Command descry is the CLI front end: index / status / search / graph / eval.
+// It persists the index to a local SQLite file so re-runs are instant.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jKiler/descry/internal/chunk"
+	"github.com/jKiler/descry/internal/embed"
+	"github.com/jKiler/descry/internal/eval"
+	"github.com/jKiler/descry/internal/graph"
+	"github.com/jKiler/descry/internal/index"
+	"github.com/jKiler/descry/internal/mcp"
+	"github.com/jKiler/descry/internal/search"
+	"github.com/jKiler/descry/internal/skill"
+	"github.com/jKiler/descry/internal/store"
+)
+
+// version is the descry release, reported over MCP to connecting clients.
+const version = "0.1.0"
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "index":
+		dir := "."
+		if len(os.Args) > 2 {
+			dir = os.Args[2]
+		}
+		runIndex(dir)
+	case "status":
+		runStatus(".")
+	case "search":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: descry search <query>")
+			os.Exit(2)
+		}
+		runSearch(".", strings.Join(os.Args[2:], " "))
+	case "graph":
+		dir, mode := ".", "auto"
+		for _, a := range os.Args[2:] {
+			switch a {
+			case "--typed":
+				mode = "typed"
+			case "--named":
+				mode = "named"
+			default:
+				dir = a
+			}
+		}
+		runGraph(dir, mode)
+	case "eval":
+		set := "eval_queries.json"
+		if len(os.Args) > 2 {
+			set = os.Args[2]
+		}
+		runEval(".", set)
+	case "skill":
+		sub := ""
+		if len(os.Args) > 2 {
+			sub = os.Args[2]
+		}
+		runSkill(sub)
+	case "mcp":
+		// An explicit root pins the server to one repository. Left empty, the
+		// server follows whichever project the client has open (MCP roots).
+		root := os.Getenv("DESCRY_ROOT")
+		if len(os.Args) > 2 {
+			root = os.Args[2]
+		}
+		runMCP(root)
+	case "-h", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+}
+
+// indexDirName is the per-repository directory holding the index and the embed
+// cache. It lives inside the repository being indexed, so the index travels with
+// the code rather than with whatever directory a command happened to run in.
+const indexDirName = ".descry"
+
+// dbPathFor returns the index database path for a repository root.
+func dbPathFor(root string) string { return filepath.Join(root, indexDirName, "index.db") }
+
+// openPipeline opens the persistent SQLite index and wires it into a pipeline.
+// The caller must Close the returned store.
+// pipelineVersion is bumped whenever a change improves the QUALITY of stored data
+// (smarter chunking, better tokenization, a new graph, etc.). Bumping it changes
+// the index fingerprint, which transparently rebuilds every user's index on their
+// next run. Record what each bump changed in DESIGN.md.
+const pipelineVersion = 3
+
+func openPipeline(root string) (*index.Pipeline, *store.SQLiteStore, error) {
+	dbPath := dbPathFor(root)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return nil, nil, fmt.Errorf("create index dir: %w", err)
+	}
+	chk := chunk.NewASTChunker() // AST chunking, with a LineChunker fallback
+
+	// Semantic embeddings via all-MiniLM-L6-v2 on ONNX Runtime. DESCRY_MODEL=q8
+	// swaps in the int8-quantized export; its distinct embedder ID gives it its
+	// own fingerprint and cache keyspace, so switching back and forth is a
+	// (cache-warm) rebuild, never a corruption.
+	modelPath, vocabPath, embedderID, err := embed.EnsureModel(os.Getenv("DESCRY_MODEL"))
+	if err != nil {
+		return nil, nil, err
+	}
+	onnx, err := embed.NewOrtEmbedderID(modelPath, vocabPath, embedderID)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Persistent vector cache: fingerprint-driven rebuilds (pipeline bumps,
+	// schema changes) re-embed only chunks whose text actually changed. Lives
+	// beside the index but in its own file, so index clears never clear it.
+	emb, err := embed.NewCachedEmbedder(onnx, filepath.Join(filepath.Dir(dbPath), "embed_cache.db"))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	fp := store.Fingerprint{
+		Schema:   store.SchemaVersion,
+		Pipeline: pipelineVersion,
+		Embedder: emb.ID(),
+		Dim:      emb.Dim(),
+		Chunker:  chk.ID(),
+	}
+	s, err := store.OpenSQLite(dbPath, fp)
+	if err != nil {
+		return nil, nil, err
+	}
+	if v, ok := envFloat("DESCRY_RERANK_MULT"); ok {
+		s.SetRerankMult(int(v))
+	}
+	p := index.New(chk, emb, s)
+	p.Progress = indexProgress()
+	return p, s, nil
+}
+
+// indexProgress returns a Pipeline.Progress renderer: a \r-rewriting status line
+// on stderr when it's a terminal, or periodic lines when piped (logs, CI).
+// Every indexing phase reports, so a large repository never looks hung — the
+// tree walk and the final commit each take real time before/after embedding.
+//
+// Rendered on stderr so `search` results on stdout stay clean. The callback is
+// invoked concurrently from embed workers, hence the mutex; counts can arrive
+// slightly out of order, hence the per-phase high-water-mark check.
+func indexProgress() func(phase string, done, total int) {
+	fi, err := os.Stderr.Stat()
+	isTTY := err == nil && fi.Mode()&os.ModeCharDevice != 0
+
+	var mu sync.Mutex
+	var lastShown time.Time
+	phase, best, lastStep := "", -1, -1
+	return func(p string, done, total int) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if p != phase { // entering a new phase: reset, and end the previous line
+			if phase != "" && isTTY {
+				fmt.Fprintln(os.Stderr)
+			}
+			phase, best, lastStep = p, -1, -1
+		}
+		if done < best {
+			return // stale out-of-order update
+		}
+		best = done
+
+		msg := phaseMessage(p, done, total)
+		if isTTY {
+			// Throttle repaints; always paint the start and the finish.
+			if done != 0 && (total == 0 || done != total) && time.Since(lastShown) < 100*time.Millisecond {
+				return
+			}
+			lastShown = time.Now()
+			fmt.Fprintf(os.Stderr, "\r\033[K%s", msg)
+			if total > 0 && done == total {
+				fmt.Fprintln(os.Stderr)
+				phase = "" // finished cleanly; don't emit a second newline
+			}
+			return
+		}
+		// Piped: one line per 10% (or per 500 files while scanning), so logs
+		// stay readable but still show life.
+		step := done
+		if total > 0 {
+			step = done * 10 / total
+		} else {
+			step = done / 500
+		}
+		if step != lastStep {
+			lastStep = step
+			fmt.Fprintln(os.Stderr, msg)
+		}
+	}
+}
+
+// phaseMessage renders one progress line for a phase.
+func phaseMessage(phase string, done, total int) string {
+	switch phase {
+	case index.PhaseScanning:
+		if total > 0 && done >= total {
+			return fmt.Sprintf("scanned %d files", total)
+		}
+		return fmt.Sprintf("scanning %d files", done)
+	case index.PhaseEmbedding:
+		if total > 0 {
+			return fmt.Sprintf("embedding %d/%d chunks (%3d%%)", done, total, done*100/total)
+		}
+		return "embedding chunks"
+	case index.PhaseStoring:
+		if done >= total && total > 0 {
+			return fmt.Sprintf("stored %d chunks", total)
+		}
+		return fmt.Sprintf("writing %d chunks to the index", total)
+	default:
+		return phase
+	}
+}
+
+// buildHybrid constructs the hybrid retriever, letting the RRF weights be
+// overridden at runtime via DESCRY_VEC_WEIGHT / DESCRY_LEX_WEIGHT. This is what
+// makes weight sweeps cheap — no recompile: build once, re-run `descry eval`
+// with different env values against the same persisted index.
+func buildHybrid(p *index.Pipeline, lex *search.BM25) *search.Hybrid {
+	h := search.NewHybrid(p.Emb, p.Store, lex)
+	if v, ok := envFloat("DESCRY_VEC_WEIGHT"); ok {
+		h.VecWeight = v
+	}
+	if v, ok := envFloat("DESCRY_LEX_WEIGHT"); ok {
+		h.LexWeight = v
+	}
+	if v, ok := envFloat("DESCRY_RRF_K"); ok {
+		h.RRFK = v
+	}
+	if v, ok := envFloat("DESCRY_CAND_MULT"); ok {
+		h.CandMult = int(v)
+	}
+	if v, ok := envFloat("DESCRY_LEXFILE_WEIGHT"); ok {
+		h.LexFileWeight = v
+	}
+	if v, ok := envFloat("DESCRY_FUSE_ALPHA"); ok {
+		h.FuseAlpha = v
+	}
+	return h
+}
+
+// newBM25 builds the lexical ranker, honoring DESCRY_BM25_PATH=0 to disable
+// path/symbol tokens (an A/B switch for eval; the default is on).
+func newBM25() *search.BM25 {
+	lex := search.NewBM25()
+	if os.Getenv("DESCRY_BM25_PATH") == "0" {
+		lex.PathTokens = false
+	}
+	return lex
+}
+
+// loadOrBuildBM25 returns one of the two lexical rankers (kind selects
+// store.LexicalChunks or store.LexicalFiles) over the store's chunks. It loads
+// the persisted inverted index when present — avoiding the from-scratch rebuild
+// that dominates startup on a large repo — and otherwise builds and persists it.
+// The persisted index is the canonical, default-config build; when a build-time
+// override is active (DESCRY_BM25_PATH=0) it builds a fresh in-memory index and
+// leaves the cache untouched.
+func loadOrBuildBM25(s *store.SQLiteStore, kind int) *search.BM25 {
+	lex := newBM25()
+	chunks := s.All()
+	docs := chunks
+	if kind == store.LexicalFiles {
+		docs = search.FileDocs(chunks)
+	}
+	canonical := lex.PathTokens // the only build-time config knob today
+
+	if canonical {
+		if data, n, ok := s.LoadLexical(kind); ok && n == len(chunks) {
+			if b, ok := search.DecodeBM25(data, docs); ok {
+				return b
+			}
+		}
+	}
+	lex.Index(docs)
+	if canonical {
+		if data := lex.Encode(); len(data) > 0 {
+			_ = s.SaveLexical(kind, data, len(chunks)) // best effort; a miss just rebuilds next time
+		}
+	}
+	return lex
+}
+
+// readyHybrid makes dir searchable: it indexes it if the store is empty (later
+// runs reuse the persisted index), then builds both lexical rankers (chunk- and
+// file-level) and the hybrid retriever over them.
+func readyHybrid(p *index.Pipeline, s *store.SQLiteStore, dir string) (*search.Hybrid, error) {
+	if s.Len() == 0 {
+		if _, err := index.IndexDir(p, dir); err != nil {
+			return nil, err
+		}
+	}
+	h := buildHybrid(p, loadOrBuildBM25(s, store.LexicalChunks))
+	h.LexFile = loadOrBuildBM25(s, store.LexicalFiles)
+	return h, nil
+}
+
+// envFloat reads a float64 from an env var; ok is false if unset or unparseable.
+func envFloat(key string) (float64, bool) {
+	s := os.Getenv(key)
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// runIndex indexes dir, writing the index into dir/.descry.
+func runIndex(dir string) {
+	p, s, err := openPipeline(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open error:", err)
+		os.Exit(1)
+	}
+	defer s.Close()
+
+	if s.Len() > 0 {
+		// Name index.db specifically: deleting the whole .descry dir also
+		// deletes embed_cache.db, which is what makes a rebuild nearly free.
+		fmt.Printf("index already has %d chunks in %s\n", s.Len(), dbPathFor(dir))
+		fmt.Printf("to rebuild, delete that index.db file — keep embed_cache.db beside it, its cached vectors make the rebuild fast\n")
+		return
+	}
+	files, err := index.IndexDir(p, dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "index error:", err)
+		os.Exit(1)
+	}
+	// Building + persisting the lexical indexes is seconds on a large repo, and
+	// silent otherwise.
+	fmt.Fprintln(os.Stderr, "building lexical indexes")
+	loadOrBuildBM25(s, store.LexicalChunks) // do both now, so the first search is fast
+	loadOrBuildBM25(s, store.LexicalFiles)
+	fmt.Printf("indexed %d files, %d chunks into %s\n", files, s.Len(), dbPathFor(dir))
+	nudgeSkill()
+}
+
+// nudgeSkill keeps the user-level agent skill in play after an index: a stale
+// installed copy is silently refreshed (the user opted in by installing it),
+// and a missing one earns a one-line tip. Best-effort — never fails the index.
+func nudgeSkill() {
+	switch installed, stale := skill.UserState(); {
+	case installed && stale:
+		if _, err := skill.InstallUser(); err == nil {
+			fmt.Fprintln(os.Stderr, "refreshed the descry agent skill (user level)")
+		}
+	case !installed:
+		fmt.Fprintln(os.Stderr, "tip: `descry skill install` teaches coding agents (Claude Code, Codex, …) to search with descry")
+	}
+}
+
+// runSkill prints the agent skill ("descry skill") or installs it at user
+// level ("descry skill install").
+func runSkill(sub string) {
+	switch sub {
+	case "":
+		fmt.Print(skill.Markdown())
+	case "install":
+		written, err := skill.InstallUser()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "skill install error:", err)
+			os.Exit(1)
+		}
+		home, _ := os.UserHomeDir()
+		for _, rel := range written {
+			fmt.Printf("installed %s\n", filepath.Join(home, rel))
+		}
+		fmt.Println("agents can now load the /descry skill; re-run after upgrading descry to refresh it")
+	default:
+		fmt.Fprintf(os.Stderr, "unknown skill subcommand %q\nusage: descry skill [install]\n", sub)
+		os.Exit(2)
+	}
+}
+
+func runStatus(root string) {
+	dbPath := dbPathFor(root)
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		fmt.Printf("no index at %s — run `descry index` first\n", dbPath)
+		return
+	}
+	_, s, err := openPipeline(root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open error:", err)
+		os.Exit(1)
+	}
+	defer s.Close()
+	fmt.Printf("%d chunks indexed in %s\n", s.Len(), dbPath)
+}
+
+func runSearch(dir, query string) {
+	p, s, err := openPipeline(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open error:", err)
+		os.Exit(1)
+	}
+	defer s.Close()
+
+	h, err := readyHybrid(p, s, dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "index error:", err)
+		os.Exit(1)
+	}
+
+	// File-level results: one hit per file (its best chunk), which is both what
+	// the eval validates and what a caller scanning results wants.
+	results := h.SearchFiles(query, 10)
+	if len(results) == 0 {
+		fmt.Println("no results")
+		return
+	}
+	for i, r := range results {
+		loc := fmt.Sprintf("%s:%d-%d", r.Chunk.Path, r.Chunk.StartLine, r.Chunk.EndLine)
+		fmt.Printf("%2d. [%.3f] %s\n", i+1, r.Score, loc)
+	}
+}
+
+func runEval(root, querySetPath string) {
+	p, s, err := openPipeline(root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open error:", err)
+		os.Exit(1)
+	}
+	defer s.Close()
+
+	h, err := readyHybrid(p, s, root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "index error:", err)
+		os.Exit(1)
+	}
+
+	// Gold labels are file paths, so retrieve at file granularity: each ranker's
+	// chunk list collapses to files before fusion (see Hybrid.SearchFiles).
+	// (Summing RRF scores per file was tried and is much worse — chunk-rich
+	// files crowd out the single best hit; see DESIGN.md.)
+	retrieve := func(query string, k int) []string {
+		results := h.SearchFiles(query, k)
+		paths := make([]string, len(results))
+		for i, r := range results {
+			paths[i] = r.Chunk.Path
+		}
+		return paths
+	}
+
+	set, err := loadQuerySet(querySetPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "queryset error:", err)
+		os.Exit(1)
+	}
+	if os.Getenv("DESCRY_EVAL_VERBOSE") == "1" {
+		rep, perQuery := eval.EvaluateVerbose(retrieve, set, 10)
+		for _, qr := range perQuery {
+			rank := fmt.Sprintf("%4d", qr.Rank)
+			if qr.Rank == 0 {
+				rank = "MISS"
+			}
+			fmt.Printf("%s  %s\n", rank, qr.Query)
+		}
+		fmt.Printf("queries=%d  Recall@%d=%.3f  MRR=%.3f\n", rep.Queries, rep.K, rep.RecallAtK, rep.MRR)
+		return
+	}
+
+	// Default report: recall at several cutoffs plus MRR, one line.
+	rep := eval.EvaluateAtKs(retrieve, set, []int{5, 7, 10, 15, 20})
+	fmt.Printf("queries=%d ", rep.Queries)
+	for i, k := range rep.Ks {
+		fmt.Printf(" R@%d=%.1f%%", k, rep.Recall[i]*100)
+	}
+	fmt.Printf("  MRR=%.3f\n", rep.MRR)
+}
+
+func loadQuerySet(path string) ([]eval.Labeled, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var set []eval.Labeled
+	if err := json.Unmarshal(data, &set); err != nil {
+		return nil, err
+	}
+	return set, nil
+}
+
+// runGraph prints the call graph as Mermaid. mode selects the resolver:
+// "typed" (go/types, strict), "named" (name-based heuristic), or "auto"
+// (default: typed with an automatic fallback to name-based).
+func runGraph(dir, mode string) {
+	var (
+		g   *graph.Graph
+		err error
+	)
+	switch mode {
+	case "typed":
+		g, err = graph.BuildFromGoDirTyped(dir) // strict; dir must be a module
+	case "named":
+		g, err = graph.BuildFromGoDir(dir) // name-based heuristic
+	default: // auto
+		var typed bool
+		g, typed, err = graph.Build(dir)
+		if err == nil && !typed {
+			fmt.Fprintln(os.Stderr, "note: typed graph unavailable, used the name-based resolver")
+		}
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "graph error:", err)
+		os.Exit(1)
+	}
+	fmt.Println(g.ToMermaid()) // paste into any Mermaid renderer
+}
+
+// runMCP serves descry over the Model Context Protocol on stdio.
+//
+// If root is empty the server follows whichever project the client has open
+// (via MCP roots), so one globally-configured server works across repositories.
+// A non-empty root pins it to that repository. Repositories are opened lazily on
+// first use — an MCP client launches the server from an arbitrary working
+// directory, so nothing may be opened relative to the process CWD at startup.
+func runMCP(root string) {
+	if root != "" {
+		abs, err := filepath.Abs(root)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "resolve root:", err)
+			os.Exit(1)
+		}
+		if fi, statErr := os.Stat(abs); statErr != nil || !fi.IsDir() {
+			fmt.Fprintf(os.Stderr, "descry mcp: %q is not a directory.\n"+
+				"Pass a repository path, e.g. `descry mcp /path/to/repo` (or set DESCRY_ROOT),\n"+
+				"or omit it to follow the project your MCP client has open.\n", abs)
+			os.Exit(1)
+		}
+		root = abs
+	}
+
+	srv := &mcp.Server{Root: root, Open: openWorkspace}
+	defer srv.Close()
+
+	if err := srv.Serve(context.Background(), version); err != nil {
+		fmt.Fprintln(os.Stderr, "mcp error:", err)
+		os.Exit(1)
+	}
+}
+
+// openWorkspace opens one repository for the MCP server: the index (building it
+// if absent) and the hybrid retriever. The MCP server runs this on a background
+// goroutine and forwards progress to in-flight tool calls, so a cold repository
+// never blocks a request. The call graph is deliberately NOT built here — it is
+// built lazily via BuildGraph on first graph-tool use, so a search-only session
+// stays fast. Diagnostics go to stderr so stdout stays reserved for JSON-RPC.
+func openWorkspace(root string, progress func(phase string, done, total int)) (*mcp.Workspace, error) {
+	p, s, err := openPipeline(root)
+	if err != nil {
+		return nil, fmt.Errorf("open index for %s (descry writes to <root>/%s, which must be writable): %w",
+			root, indexDirName, err)
+	}
+
+	if s.Len() == 0 { // readyHybrid will build the index; announce and wire progress
+		fmt.Fprintf(os.Stderr, "descry: no index at %s — building it now\n", dbPathFor(root))
+		progress("indexing", 0, 0)
+		// Report embedding progress to the MCP caller as well as stderr.
+		stderrProgress := p.Progress
+		p.Progress = func(phase string, done, total int) {
+			if stderrProgress != nil {
+				stderrProgress(phase, done, total)
+			}
+			// The MCP side only distinguishes "indexing"; the sub-phase detail
+			// goes to stderr (the client's log) via stderrProgress.
+			progress("indexing", done, total)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "descry: loading existing index for %s (%d chunks)\n", root, s.Len())
+		progress("loading", 0, 0)
+	}
+
+	h, err := readyHybrid(p, s, root)
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("index %s: %w", root, err)
+	}
+	fmt.Fprintf(os.Stderr, "descry: serving %s (%d chunks)\n", root, s.Len())
+
+	return &mcp.Workspace{
+		Search:    h.SearchFiles, // one hit per file — the benchmarked retrieval surface
+		Chunks:    s.Len,
+		IndexPath: dbPathFor(root),
+		BuildGraph: func() (*graph.Graph, error) {
+			// Typed (go/types), falling back to name-based. Built once, lazily.
+			g, typed, gerr := graph.Build(root)
+			if gerr != nil {
+				return nil, gerr
+			}
+			resolver := "name-based"
+			if typed {
+				resolver = "typed"
+			}
+			fmt.Fprintf(os.Stderr, "descry: %s call graph for %s (%d symbols)\n", resolver, root, len(g.Nodes()))
+			return g, nil
+		},
+		Close: s.Close,
+	}, nil
+}
+
+func usage() {
+	fmt.Println(`descry — a local hybrid (vector + BM25) code search index
+
+usage:
+  descry index [dir]     walk dir, chunk + embed + store (default ".")
+  descry status          report how many chunks are indexed
+  descry search <query>  hybrid (vector + BM25) search over the current dir
+  descry graph [dir] [--typed|--named]  print the call graph as Mermaid (default: typed, falls back to name-based)
+  descry eval [queryset.json]   score retrieval (Recall@k, MRR) vs a labeled set
+  descry mcp [dir]       serve over MCP (JSON-RPC on stdio); without dir, follows
+                         the project your MCP client has open (also DESCRY_ROOT)
+  descry skill [install] print the agent skill, or install it for coding agents
+                         (user level: ~/.claude/skills and ~/.agents/skills)`)
+}
