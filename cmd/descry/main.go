@@ -29,7 +29,7 @@ import (
 // version is the descry release, reported over MCP to connecting clients.
 // Release builds stamp the tag over it via -ldflags "-X main.version=…";
 // this default covers source builds (`go build`, `go install`).
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	inv := parseArgs(os.Args[1:])
@@ -46,6 +46,12 @@ func main() {
 		runIndex(dir)
 	case "status":
 		runStatus(".")
+	case "doctor":
+		dir := "."
+		if len(inv.args) > 0 {
+			dir = inv.args[0]
+		}
+		runDoctor(dir)
 	case "search":
 		if len(inv.args) == 0 {
 			fmt.Fprintln(os.Stderr, "usage: descry search <query>")
@@ -110,7 +116,7 @@ const (
 // rather than being read as a query.
 var subcommands = map[string]bool{
 	"index": true, "status": true, "search": true, "graph": true,
-	"eval": true, "mcp": true, "skill": true,
+	"eval": true, "mcp": true, "skill": true, "doctor": true,
 }
 
 // invocation is one parsed command line.
@@ -768,6 +774,8 @@ usage:
   descry <query>         search this repo (quotes optional); a cold repo asks first
   descry index [dir]     walk dir, chunk + embed + store (default ".")
   descry status          report how many chunks are indexed
+  descry doctor [dir]    health-check the runtime, model, index and agent skill
+                         (read-only; exits 1 if something is broken)
   descry search <query>  explicit search; indexes a cold repo without asking (script-friendly)
   descry graph [dir] [--typed|--named]  print the call graph as Mermaid (default: typed, falls back to name-based)
   descry eval [queryset.json]   score retrieval (Recall@k, MRR) vs a labeled set

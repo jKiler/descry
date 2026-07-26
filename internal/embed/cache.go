@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS vectors (
 // NewCachedEmbedder opens (creating if needed) the cache database at path and
 // wraps inner with it.
 func NewCachedEmbedder(inner Embedder, path string) (*CachedEmbedder, error) {
-	db, err := sql.Open("sqlite", path)
+	// core.SQLiteDSN, not a bare path: the cache lives inside the repository being
+	// indexed, so its path is user-controlled — see the DSN doc comment for why
+	// a bare path opens the wrong file.
+	db, err := sql.Open("sqlite", core.SQLiteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open embed cache: %w", err)
 	}

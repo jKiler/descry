@@ -54,6 +54,93 @@ var systemLibPaths = []string{
 	"/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
 }
 
+// ORTSource names which step of the resolution chain answered.
+type ORTSource string
+
+const (
+	ORTFromEnv       ORTSource = "DESCRY_ORT_LIB"  // explicit override
+	ORTFromCache     ORTSource = "cached download" // downloaded here earlier
+	ORTFromSystem    ORTSource = "system install"  // Homebrew, /usr/lib, …
+	ORTNeedsDownload ORTSource = "not cached"      // would download on first use
+
+	// ORTUnsupported means descry cannot provision the library here: either no
+	// pinned build exists for this platform, or there is nowhere to cache one.
+	// Either way the user must install onnxruntime and set DESCRY_ORT_LIB.
+	ORTUnsupported ORTSource = "unsupported"
+)
+
+// ORTState is where the onnxruntime library would come from, resolved without
+// touching the network. Err is set only for a *broken* state (a DESCRY_ORT_LIB
+// pointing at nothing, an unreadable cache dir, an unsupported platform);
+// ORTNeedsDownload is a healthy state that simply hasn't happened yet.
+type ORTState struct {
+	Source  ORTSource
+	Path    string // resolved library, or where a download would land
+	URL     string // release archive, when Source is ORTNeedsDownload
+	Version string
+	Err     error
+
+	// asset is the pinned release entry behind URL. Carried rather than
+	// re-derived by the downloader, so the archive name and — the part that
+	// matters — the digest it is verified against can never be looked up from a
+	// different map entry than the URL was.
+	asset ortAsset
+}
+
+// LocateOnnxRuntime reports where the onnxruntime shared library resolves from,
+// without downloading anything. It is the read-only half of EnsureOnnxRuntime,
+// which is defined in terms of it so the two can't describe different chains.
+func LocateOnnxRuntime() ORTState {
+	st := ORTState{Version: ortVersion}
+
+	if p := os.Getenv("DESCRY_ORT_LIB"); p != "" {
+		st.Source, st.Path = ORTFromEnv, p
+		if _, err := os.Stat(p); err != nil {
+			// The stat error already names the path; don't repeat it.
+			st.Err = fmt.Errorf("DESCRY_ORT_LIB: %w", err)
+		}
+		return st
+	}
+
+	// The cache dir is only needed for steps 2 and 4, so a machine where it
+	// can't be resolved (no HOME, as in a minimal container) still gets the
+	// benefit of a system install.
+	dir, cacheErr := ortCacheDir()
+	var cached string
+	if cacheErr == nil {
+		cached = filepath.Join(dir, ortLibName())
+		if _, err := os.Stat(cached); err == nil {
+			st.Source, st.Path = ORTFromCache, cached
+			return st
+		}
+	}
+
+	for _, p := range systemLibPaths {
+		if _, err := os.Stat(p); err == nil {
+			st.Source, st.Path = ORTFromSystem, p
+			return st
+		}
+	}
+
+	asset, ok := ortAssets[runtime.GOOS+"/"+runtime.GOARCH]
+	if !ok {
+		st.Source = ORTUnsupported
+		st.Err = fmt.Errorf("no pinned ONNX Runtime build for %s/%s: install onnxruntime and set DESCRY_ORT_LIB to the shared library",
+			runtime.GOOS, runtime.GOARCH)
+		return st
+	}
+	if cacheErr != nil {
+		// A pinned build exists, but there is nowhere to cache it.
+		st.Source, st.Err = ORTUnsupported, cacheErr
+		return st
+	}
+	st.Source = ORTNeedsDownload
+	st.Path = cached
+	st.asset = asset
+	st.URL = "https://github.com/microsoft/onnxruntime/releases/download/v" + ortVersion + "/" + asset.name
+	return st
+}
+
 // EnsureOnnxRuntime returns a path to the onnxruntime shared library, resolving
 // in this order:
 //
@@ -62,46 +149,28 @@ var systemLibPaths = []string{
 //  3. a system install (Homebrew, /usr/lib, …);
 //  4. the pinned release for this platform, downloaded and sha256-verified.
 //
-// Only step 4 touches the network, and only once per machine.
+// Only step 4 touches the network, and only once per machine. Use
+// LocateOnnxRuntime to inspect the same chain without downloading.
 func EnsureOnnxRuntime() (string, error) {
-	if p := os.Getenv("DESCRY_ORT_LIB"); p != "" {
-		if _, err := os.Stat(p); err != nil {
-			return "", fmt.Errorf("DESCRY_ORT_LIB=%s: %w", p, err)
-		}
-		return p, nil
+	st := LocateOnnxRuntime()
+	if st.Err != nil {
+		return "", st.Err
+	}
+	if st.Source != ORTNeedsDownload {
+		return st.Path, nil
 	}
 
-	dir, err := ortCacheDir()
-	if err != nil {
-		return "", err
-	}
-	cached := filepath.Join(dir, ortLibName())
-	if _, err := os.Stat(cached); err == nil {
-		return cached, nil
-	}
-
-	for _, p := range systemLibPaths {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-
-	asset, ok := ortAssets[runtime.GOOS+"/"+runtime.GOARCH]
-	if !ok {
-		return "", fmt.Errorf("no pinned ONNX Runtime build for %s/%s: install onnxruntime and set DESCRY_ORT_LIB to the shared library",
-			runtime.GOOS, runtime.GOARCH)
-	}
-	url := "https://github.com/microsoft/onnxruntime/releases/download/v" + ortVersion + "/" + asset.name
-
+	cached := st.Path
+	dir := filepath.Dir(cached)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	archive := filepath.Join(dir, asset.name)
+	archive := filepath.Join(dir, st.asset.name)
 	fmt.Fprintf(os.Stderr, "descry: downloading ONNX Runtime %s for %s/%s (one time)\n", ortVersion, runtime.GOOS, runtime.GOARCH)
-	if err := downloadOnce(url, archive); err != nil {
+	if err := downloadOnce(st.URL, archive); err != nil {
 		return "", fmt.Errorf("download onnxruntime: %w", err)
 	}
-	if err := verifySHA256(archive, asset.sha256); err != nil {
+	if err := verifySHA256(archive, st.asset.sha256); err != nil {
 		os.Remove(archive)
 		return "", fmt.Errorf("onnxruntime integrity: %w", err)
 	}
@@ -116,7 +185,7 @@ func EnsureOnnxRuntime() (string, error) {
 func ortCacheDir() (string, error) {
 	cache, err := os.UserCacheDir()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("user cache dir: %w", err)
 	}
 	return filepath.Join(cache, "descry", "runtime", ortVersion), nil
 }

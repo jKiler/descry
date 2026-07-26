@@ -43,30 +43,75 @@ var modelSpecs = map[string]modelSpec{
 	},
 }
 
+// ModelState is where the selected model's files live (or would land), resolved
+// without downloading. Cached reports whether both files are already present —
+// the difference between an instant first index and a ~90MB download.
+type ModelState struct {
+	ID          string // embedder identity for the model's vector space
+	ModelPath   string
+	VocabPath   string
+	ModelCached bool
+	VocabCached bool
+	ModelBytes  int64 // size on disk, when cached
+	URL         string
+
+	// sha256 is the pinned digest for URL, "" for an unpinned export. Carried
+	// so the downloader verifies against the same spec this state describes
+	// rather than looking the spec up a second time.
+	sha256 string
+}
+
+// Cached reports whether both the model and its vocab are on disk, so the next
+// index needs no network.
+func (m ModelState) Cached() bool { return m.ModelCached && m.VocabCached }
+
+// LocateModel reports where the MiniLM export selected by name resolves to,
+// without fetching it. It is the read-only half of EnsureModel, which builds on
+// it so the two can't disagree about paths or identity.
+func LocateModel(name string) (ModelState, error) {
+	spec, ok := modelSpecs[name]
+	if !ok {
+		return ModelState{}, fmt.Errorf("unknown DESCRY_MODEL %q (valid: unset for fp32, \"q8\")", name)
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return ModelState{}, fmt.Errorf("locate model cache dir: %w", err)
+	}
+	dir := filepath.Join(cache, "descry", "models")
+	st := ModelState{
+		ID:        spec.id,
+		ModelPath: filepath.Join(dir, spec.file),
+		VocabPath: filepath.Join(dir, "vocab.txt"),
+		URL:       spec.url,
+		sha256:    spec.sha256,
+	}
+	if fi, err := os.Stat(st.ModelPath); err == nil {
+		st.ModelCached, st.ModelBytes = true, fi.Size()
+	}
+	if _, err := os.Stat(st.VocabPath); err == nil {
+		st.VocabCached = true
+	}
+	return st, nil
+}
+
 // EnsureModel returns local paths to the MiniLM export selected by name (a
 // DESCRY_MODEL value: "" for the fp32 default, "q8" for the quantized export)
 // and its WordPiece vocab, downloading either to the user cache dir if missing.
 // The ~90MB model download happens once, on the first indexing run; pinned
 // exports are sha256-verified, and a mismatched file is deleted and rejected.
 // The returned id is the embedder identity for the model's vector space (see
-// NewOrtEmbedderID).
+// NewOrtEmbedderID). Use LocateModel to inspect this without downloading.
 func EnsureModel(name string) (modelPath, vocabPath, id string, err error) {
-	spec, ok := modelSpecs[name]
-	if !ok {
-		return "", "", "", fmt.Errorf("unknown DESCRY_MODEL %q (valid: unset for fp32, \"q8\")", name)
-	}
-	cache, err := os.UserCacheDir()
+	st, err := LocateModel(name)
 	if err != nil {
 		return "", "", "", err
 	}
-	dir := filepath.Join(cache, "descry", "models")
-	modelPath = filepath.Join(dir, spec.file)
-	vocabPath = filepath.Join(dir, "vocab.txt")
-	if err := downloadOnce(spec.url, modelPath); err != nil {
+	modelPath, vocabPath = st.ModelPath, st.VocabPath
+	if err := downloadOnce(st.URL, modelPath); err != nil {
 		return "", "", "", fmt.Errorf("fetch model: %w", err)
 	}
-	if spec.sha256 != "" {
-		if err := verifySHA256(modelPath, spec.sha256); err != nil {
+	if st.sha256 != "" {
+		if err := verifySHA256(modelPath, st.sha256); err != nil {
 			os.Remove(modelPath)
 			return "", "", "", fmt.Errorf("model integrity: %w", err)
 		}
@@ -74,7 +119,7 @@ func EnsureModel(name string) (modelPath, vocabPath, id string, err error) {
 	if err := downloadOnce(minilmVocabURL, vocabPath); err != nil {
 		return "", "", "", fmt.Errorf("fetch vocab: %w", err)
 	}
-	return modelPath, vocabPath, spec.id, nil
+	return modelPath, vocabPath, st.ID, nil
 }
 
 // verifySHA256 checks a file against an expected hex digest.

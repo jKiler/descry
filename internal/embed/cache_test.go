@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,53 @@ func TestCachedEmbedderHitsSkipInner(t *testing.T) {
 		if first[i] != second[i] {
 			t.Fatalf("cached vector differs at %d: %v vs %v", i, first[i], second[i])
 		}
+	}
+}
+
+// TestCachedEmbedderHandlesURISyntaxInPath is the embed-cache half of
+// store's TestInspectHandlesURISyntaxInPath. The cache lives inside the
+// repository being indexed, so its path is user-controlled, and a bare DSN gets
+// truncated at the first '?' — which used to mean every cached vector was
+// written into a stray database created at the truncated path, on every index.
+func TestCachedEmbedderHandlesURISyntaxInPath(t *testing.T) {
+	for _, name := range []string{"proj?v2", "proj#2", "proj%2", "proj 2"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "embed_cache.db")
+
+			inner := &countingEmbedder{inner: NewHashEmbedder(64)}
+			ce, err := NewCachedEmbedder(inner, path)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			ce.Embed("some chunk text")
+			ce.Embed("some chunk text")
+			ce.Close()
+
+			if got := inner.calls.Load(); got != 1 {
+				t.Errorf("inner called %d times, want 1 — the cache did not persist", got)
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Errorf("cache not written to its own path: %v", err)
+			}
+			// A truncated DSN would have created a database beside the
+			// directory rather than inside it.
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				var got []string
+				for _, e := range entries {
+					got = append(got, e.Name())
+				}
+				t.Errorf("opening the cache created stray files: %v", got)
+			}
+		})
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/jKiler/descry/internal/core"
 
@@ -83,7 +84,7 @@ const (
 // OpenSQLite opens (creating if needed) the database at path, ensures the
 // schema, and loads any existing rows into the in-memory mirror.
 func OpenSQLite(path string, fp Fingerprint) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", core.SQLiteDSN(path))
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +121,36 @@ func OpenSQLite(path string, fp Fingerprint) (*SQLiteStore, error) {
 		return nil, err
 	}
 	return &SQLiteStore{db: db, mem: mem}, nil
+}
+
+// IndexInfo is a read-only look at an existing index file.
+type IndexInfo struct {
+	Fingerprint string // the recorded fingerprint, in Fingerprint.String() form
+	Chunks      int
+}
+
+// Inspect reports an existing index's fingerprint and chunk count without
+// opening the pipeline. Diagnostics must use this rather than OpenSQLite:
+// opening with a mismatched fingerprint *clears the index* by design, which
+// would turn a "what's wrong?" command into a destructive one.
+func Inspect(path string) (IndexInfo, error) {
+	var info IndexInfo
+	if _, err := os.Stat(path); err != nil {
+		return info, err
+	}
+	// mode=ro so an inspection can never create or migrate a file.
+	db, err := sql.Open("sqlite", core.SQLiteDSN(path, "mode=ro"))
+	if err != nil {
+		return info, err
+	}
+	defer db.Close()
+	if err := db.QueryRow(`SELECT value FROM meta WHERE key = 'fingerprint'`).Scan(&info.Fingerprint); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return info, err
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&info.Chunks); err != nil {
+		return info, err
+	}
+	return info, nil
 }
 
 // ensureFingerprint compares the stored index fingerprint with the current one.

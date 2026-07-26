@@ -86,7 +86,38 @@ descry mcp
 
 # Install the agent skill so coding agents reach for descry when they search.
 descry skill install
+
+# Health-check everything that has to resolve before a query can be answered.
+descry doctor
 ```
+
+### `descry doctor`
+
+First runs have a deep resolution chain — cgo, the ONNX Runtime library, the
+model files, the index and its fingerprint — and when it works, all of it is
+invisible. `doctor` reports the whole chain at once instead of surfacing it one
+error at a time:
+
+```
+✓ build        descry 0.1.0  darwin/arm64  go1.26.2  cgo enabled
+✓ onnxruntime  /opt/homebrew/lib/libonnxruntime.dylib (system install)
+✓ model        all-MiniLM-L6-v2 (cached, 86.2 MB)
+– index        483 chunks in .descry/index.db — stale: embedder all-MiniLM-L6-v2 → all-MiniLM-L6-v2-q8
+               the next index or search rebuilds it automatically
+✓ embed cache  1.0 MB — a rebuild reuses these vectors
+– agent skill  not installed
+               fix: run `descry skill install` so coding agents search with descry
+```
+
+It is strictly read-only: it never downloads (an uncached model reports as
+"downloaded on first index" rather than fetching ~90MB from a diagnostic), and
+it never rebuilds — it reads the index's recorded fingerprint directly rather
+than opening it, because opening an index with a moved-on fingerprint *clears*
+it by design. A stale index names the field that drifted, so a surprise rebuild
+has a visible cause. `✗` marks something descry cannot work without and exits
+1, so scripts and CI can gate on it; `–` is advisory. Any retrieval knobs left
+in the environment (`DESCRY_VEC_WEIGHT` and friends) are reported too, since a
+stale override silently changes every result with no other symptom.
 
 A query against a cold repository asks for consent (naming the directory) and
 then indexes and answers in one run; non-interactive runs never prompt or

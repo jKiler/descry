@@ -40,6 +40,22 @@ library and model auto-provision on first use.
   search query (`parseArgs` in `cmd/descry/main.go`). Adding a subcommand name
   is therefore a breaking change for one-word queries — extend the
   `subcommands` set deliberately, and never prompt when stdin is not a TTY.
+- Every sqlite open goes through `core.SQLiteDSN` (index, embed cache,
+  diagnostics). These databases sit inside the repository being indexed, so
+  their paths are user-controlled, and a bare DSN is silently truncated at the
+  first `?` — creating a stray database at the truncated path. The `file:`
+  prefix and the path escaping are jointly necessary; the doc comment explains
+  why, and `TestInspectHandlesURISyntaxInPath` /
+  `TestCachedEmbedderHandlesURISyntaxInPath` pin it. It lives in `core` because
+  `store` already imports `embed`, so `store` can't own it without a cycle.
+- Diagnostics must be read-only, and must not fetch. `descry doctor` reports
+  the resolution chain via the `Locate*` probes (`embed.LocateOnnxRuntime`,
+  `embed.LocateModel`) and `store.Inspect`, never the `Ensure*` functions or
+  `store.OpenSQLite` — opening an index whose fingerprint has moved on *clears
+  it*, so a diagnostic built on it would destroy what it was asked about.
+  Pinned by `TestInspectDoesNotClearAStaleIndex` and
+  `TestLocateModelDoesNotDownload`. Each `Ensure*` is defined in terms of its
+  `Locate*` so the two can't describe different chains.
 - Retrieval defaults (`RRFK`, `VecWeight`, `LexWeight`, `LexFileWeight`,
   `FuseAlpha`, `CandMult` in `search.NewHybrid`) are the kubernetes-120 sweep
   optimum. Don't change them without re-running `descry eval` on an external
