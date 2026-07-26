@@ -8,8 +8,9 @@ package names are the layout map (chunking in `internal/chunk`, embedding in
 `internal/embed`, storage in `internal/store`, retrieval in `internal/search`,
 the indexing pipeline in `internal/index`, the call graph in `internal/graph`,
 the MCP server in `internal/mcp`, shared types in `internal/core`).
-`DESIGN.md` owns the architecture, measured benchmarks, negative results, and
-the roadmap; `README.md` owns usage and the config env-var table.
+`README.md` owns usage, the config env-var table, and the design notes
+(retrieval geometry, fingerprint mechanism, benchmarks, and the pipeline
+provenance table).
 
 **Find code with descry itself.** Use the descry MCP tools (`search`,
 `read_relevant`, `graph_impact`, `graph_trace`) or `descry search "<query>"` to
@@ -22,9 +23,10 @@ library and model auto-provision on first use.
 **Invariants**
 
 - Bump `pipelineVersion` (`cmd/descry/main.go`) whenever a change improves the
-  *quality* of stored data, and add a row to DESIGN.md's provenance table;
-  `SchemaVersion` (`internal/store/sqlite.go`) covers DB layout changes.
-  Embedder/chunker identity is fingerprinted automatically.
+  *quality* of stored data, and add a row to the provenance table in README's
+  "Reindexing & the fingerprint" section; `SchemaVersion`
+  (`internal/store/sqlite.go`) covers DB layout changes. Embedder/chunker
+  identity is fingerprinted automatically.
 - `skills/descry/SKILL.md` is **generated**: the source of truth is
   `internal/skill/skill.go`. Edit the source, run `make skill`, commit both;
   `make skill-check` and `TestCommittedSkillMatchesGenerator` fail on drift.
@@ -41,8 +43,8 @@ library and model auto-provision on first use.
 - Retrieval defaults (`RRFK`, `VecWeight`, `LexWeight`, `LexFileWeight`,
   `FuseAlpha`, `CandMult` in `search.NewHybrid`) are the kubernetes-120 sweep
   optimum. Don't change them without re-running `descry eval` on an external
-  corpus; DESIGN.md "Weight tuning" and "Negative results" record what has
-  already been tried and rejected.
+  corpus, and keep README's "Measured quality" table in step with any
+  retrieval change.
 
 ## Maintaining this file
 

@@ -164,7 +164,7 @@ func TestReciprocalRankFusion_Weights(t *testing.T) {
 }
 
 // NewHybrid's defaults are the kubernetes-120 sweep optimum (q8: R@10 95.8%,
-// MRR 0.720 — see DESIGN.md): RRF k=25, vectors slightly above full weight, the
+// MRR 0.720 — README "Measured quality"): RRF k=25, vectors slightly above full weight, the
 // chunk-level BM25 at 0.5 beside the whole-file BM25 at 1.0, and max-leaning
 // fusion (alpha 0.40) so a strong single-list match isn't buried by consensus.
 func TestNewHybrid_Defaults(t *testing.T) {

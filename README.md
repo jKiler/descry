@@ -53,9 +53,9 @@ A `Makefile` wraps the common developer tasks — run `make help` to list them
 ## Usage
 
 ```bash
-# Index the current repository (downloads the ~90MB model on first run).
 # The verb: any argument that isn't a subcommand is a search query.
-# On a repo with no index, descry shows the directory and asks before indexing.
+# On a repo with no index, descry names the directory and asks before indexing
+# (the very first run also downloads the ~90MB embedding model, once).
 descry "where is auth handled"
 descry how is auth implemented        # quotes optional
 
@@ -162,14 +162,78 @@ tuning cheap — build the index once and re-run `eval` with different values:
 ```
 walk → chunk → embed → store            (index)
 query → embed ┐
-              ├─ RRF fusion → results   (search)
+              ├─ rank fusion → results  (search)
 query → BM25 ─┘
 ```
 
 Every stage sits behind a small interface (`Chunker`, `Embedder`, `Store`), so
-implementations swap without touching callers. See **[DESIGN.md](./DESIGN.md)**
-for the architecture, the reindex/fingerprint mechanism, retrieval tuning,
-embedding-runtime trade-offs, benchmarks, and the roadmap.
+implementations swap without touching callers.
+
+### Retrieval
+
+A query produces **three rankings**, each collapsed to files (a file's rank is
+its best chunk's rank) before fusion:
+
+1. **vector** — cosine over MiniLM embeddings;
+2. **chunk BM25** — lexical match at declaration granularity, which still
+   surfaces one sharply-matching function inside a large file;
+3. **whole-file BM25** — a second BM25 whose documents are entire files, so
+   term frequency and length normalization operate on the real unit of
+   retrieval. The strongest lexical signal.
+
+Fusion is rank-based (scores across rankers aren't comparable) but not plain
+RRF: `score = best_list + α · (sum − best_list)` with α = 0.40, so one
+strongly-convinced ranker can carry a result that the others missed — plain
+summed RRF buries exactly those. Two extra signals help queries that name a
+component: each chunk's path and symbol tokens join its BM25 bag, and each
+chunk embeds as `path\ncontent` so vectors carry the component name too.
+
+Both halves are indexed rather than scanned: BM25 loads a persisted inverted
+index, and vector search scans an int8-quantized matrix then reranks the top
+candidates in exact float32 — lossless (verified against exhaustive float
+search), at int8 speed. On Kubernetes (~96k chunks) that keeps startup at
+~0.5s and a warm query at ~25ms.
+
+### Reindexing & the fingerprint
+
+The index records a fingerprint: schema version, pipeline version, embedder id
+and dimension, and chunker id. Any mismatch on open clears and rebuilds the
+index transparently — no manual invalidation, no stale results. Rebuilds are
+cheap because vectors live in a separate read-through cache keyed by
+`(embedder id, sha256 of the embed text)` that survives index clears: only new
+or edited chunks touch the model.
+
+`pipelineVersion` (in `cmd/descry/main.go`) is bumped whenever a change
+improves the *quality* of stored data. Provenance of each bump:
+
+| Version | Change |
+| ------- | ------ |
+| 1 | Baseline: AST chunking, BM25 + RRF, call graph. |
+| 2 | Exclude `_test.go` and generated files from the index. |
+| 3 | Embed each chunk as `path\ncontent` so vectors carry the component name. |
+
+### Embedding
+
+**all-MiniLM-L6-v2** (384-dim), the standard sentence-transformers recipe:
+WordPiece tokenize → ONNX forward pass → mask-weighted mean pooling → L2
+normalization. Inference runs on ONNX Runtime (~4.7ms per chunk) across a
+`GOMAXPROCS` worker pool; `DESCRY_MODEL=q8` swaps in the int8 model for ~1.9×
+faster indexing at a sub-point quality cost. Query latency is retrieval-bound,
+not model-bound — a query embeds one short string, cached after first use.
+
+### Measured quality
+
+Kubernetes corpus (~96k chunks after excluding tests and generated code), 120
+keyword-dense queries, gold = one file each, everything at shipped defaults:
+
+| Model | R@5 | R@10 | R@20 | MRR |
+| --- | --- | --- | --- | --- |
+| q8 | 88.3% | 95.8% | 98.3% | 0.720 |
+| fp32 | 89.2% | 95.8% | 98.3% | 0.726 |
+
+A 66-query natural-language set over descry's own source reads R@10 ~97%. The
+shipped weights are the optimum of a sweep on the Kubernetes set; `descry eval`
+re-scores any labeled query set against the current configuration.
 
 ## Layout
 

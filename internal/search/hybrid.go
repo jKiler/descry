@@ -21,7 +21,7 @@ type Hybrid struct {
 	// strongest single ranker, and max-leaning fusion rewards that); the
 	// chunk-level BM25 is down-weighted because the whole-file BM25 covers most
 	// of what it did. The optimum is workload-dependent; all are overridable at
-	// runtime, see DESIGN.md for the measured sweep.
+	// runtime; README "Measured quality" records the sweep results.
 	VecWeight float64
 	LexWeight float64
 
@@ -51,7 +51,7 @@ type Hybrid struct {
 
 // NewHybrid builds a hybrid retriever over an already-populated store and BM25.
 // The defaults are the kubernetes-120 sweep optimum (q8: R@10 95.8%, MRR 0.720;
-// fp32 within noise of its own optimum — see DESIGN.md); set LexFile to enable
+// fp32 within noise of its own optimum — README "Measured quality"); set LexFile to enable
 // the whole-file lexical list.
 func NewHybrid(e embed.Embedder, s store.Store, lex *BM25) *Hybrid {
 	return &Hybrid{Emb: e, Store: s, Lex: lex,

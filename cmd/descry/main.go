@@ -153,7 +153,7 @@ func dbPathFor(root string) string { return filepath.Join(root, indexDirName, "i
 // pipelineVersion is bumped whenever a change improves the QUALITY of stored data
 // (smarter chunking, better tokenization, a new graph, etc.). Bumping it changes
 // the index fingerprint, which transparently rebuilds every user's index on their
-// next run. Record what each bump changed in DESIGN.md.
+// next run. Record what each bump changed in the README provenance table.
 const pipelineVersion = 3
 
 func openPipeline(root string) (*index.Pipeline, *store.SQLiteStore, error) {
@@ -591,7 +591,7 @@ func runEval(root, querySetPath string) {
 	// Gold labels are file paths, so retrieve at file granularity: each ranker's
 	// chunk list collapses to files before fusion (see Hybrid.SearchFiles).
 	// (Summing RRF scores per file was tried and is much worse — chunk-rich
-	// files crowd out the single best hit; see DESIGN.md.)
+	// files crowd out the single best hit.)
 	retrieve := func(query string, k int) []string {
 		results := h.SearchFiles(query, k)
 		paths := make([]string, len(results))

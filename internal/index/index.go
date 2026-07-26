@@ -106,7 +106,7 @@ func IndexDir(p *Pipeline, root string) (int, error) {
 	report(PhaseScanning, files, files)
 
 	// Embedding usually dominates indexing time, so fan it out across CPU cores —
-	// measured near-linear, unlike batching (see DESIGN.md).
+	// measured near-linear, unlike batching (measured slower: padding inflates short chunks).
 	embedChunks(p.Emb, chunks, func(done, total int) { report(PhaseEmbedding, done, total) })
 
 	// One transaction for the whole index, instead of a commit per chunk. This is
@@ -190,8 +190,8 @@ func embedChunks(emb embed.Embedder, chunks []core.Chunk, progress func(done, to
 // embedText is what the embedder actually sees for a chunk: the relative file
 // path as a header line, then the content. The path names the component in
 // words the model understands after WordPiece ("internal/search/bm25.go"), so
-// queries that name a file or subsystem land nearer its chunks — a measured MRR
-// gain (see DESIGN.md). Changing this changes stored vectors, so bump
+// queries that name a file or subsystem land nearer its chunks — a measured
+// MRR gain (README "Retrieval"). Changing this changes stored vectors, so bump
 // pipelineVersion when you do.
 func embedText(c core.Chunk) string {
 	if c.Path == "" {

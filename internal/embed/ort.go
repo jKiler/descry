@@ -167,8 +167,8 @@ func NewSemanticEmbedder(modelPath, vocabPath string) (Embedder, error) {
 
 // NewSemanticEmbedderQ8 returns the int8-quantized MiniLM export — roughly
 // half the weight bytes and ~1.9x faster to index, at a sub-1pt quality cost
-// (DESIGN.md). It runs under its own identity so its vector space never mixes
-// with fp32's.
+// (README "Measured quality"). It runs under its own identity so its vector
+// space never mixes with fp32's.
 func NewSemanticEmbedderQ8(modelPath, vocabPath string) (Embedder, error) {
 	return NewOrtEmbedderID(modelPath, vocabPath, "all-MiniLM-L6-v2-q8")
 }
