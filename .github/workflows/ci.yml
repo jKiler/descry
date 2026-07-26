@@ -1,0 +1,27 @@
+# CI gate. The definition of "passing" lives in the Makefile (`make check`);
+# this workflow only provides runners. Pinned by workflow_test.go.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        # Both cgo platforms we release for. Model-dependent tests self-skip
+        # when the embedding model isn't cached, so no network or ONNX Runtime
+        # download happens here.
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make check

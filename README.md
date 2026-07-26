@@ -1,5 +1,7 @@
 # descry
 
+[![ci](https://github.com/jKiler/descry/actions/workflows/ci.yml/badge.svg)](https://github.com/jKiler/descry/actions/workflows/ci.yml)
+
 > **descry** *(v.)* — to catch sight of something distant or difficult to discern.
 
 A local, hybrid code-search index for AI coding agents and humans, written in Go.
@@ -39,6 +41,9 @@ is cached locally; everything else runs on your machine.
 ```bash
 go install github.com/jKiler/descry/cmd/descry@latest
 ```
+
+Or grab a prebuilt binary for macOS (Apple silicon) or Linux (amd64/arm64)
+from the [releases page](https://github.com/jKiler/descry/releases).
 
 Embedding runs on ONNX Runtime. The Go binding *dlopens* the library rather than
 linking it, so **building needs only a C compiler (cgo)** — the onnxruntime

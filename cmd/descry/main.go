@@ -27,7 +27,9 @@ import (
 )
 
 // version is the descry release, reported over MCP to connecting clients.
-const version = "0.1.0"
+// Release builds stamp the tag over it via -ldflags "-X main.version=…";
+// this default covers source builds (`go build`, `go install`).
+var version = "0.1.0"
 
 func main() {
 	inv := parseArgs(os.Args[1:])

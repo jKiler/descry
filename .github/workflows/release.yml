@@ -1,0 +1,70 @@
+# Release: tag v* → native cgo builds on one runner per platform, then one
+# GitHub release with tarballs + checksums. Pinned by workflow_test.go.
+#
+# The platform list is deliberately the set descry can self-provision ONNX
+# Runtime for (ortAssets in internal/embed/ortlib.go) minus windows:
+# darwin/amd64 is excluded because the pinned ONNX Runtime release publishes
+# no macOS x86_64 archive — an Intel-mac binary would fail on first use.
+# Native runners per arch mean no cgo cross-compilation anywhere.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make check
+
+  build:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, runner: ubuntu-latest }
+          - { goos: linux, goarch: arm64, runner: ubuntu-24.04-arm }
+          - { goos: darwin, goarch: arm64, runner: macos-latest }
+    runs-on: ${{ matrix.runner }}
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o descry ./cmd/descry
+      - name: Package
+        run: tar -czf "descry_${GITHUB_REF_NAME#v}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" descry LICENSE NOTICE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: descry_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: shasum -a 256 *.tar.gz > checksums.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes *.tar.gz checksums.txt
