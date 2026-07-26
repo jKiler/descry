@@ -194,3 +194,7 @@ internal/skill/     canonical agent-skill content + user-level installer
 
 - Go 1.26+ (per `go.mod`) and a C compiler (cgo) to build.
 - The onnxruntime shared library is downloaded on first use; no manual install.
+
+## License
+
+[Apache-2.0](./LICENSE)
