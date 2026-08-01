@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -29,7 +31,7 @@ import (
 // version is the descry release, reported over MCP to connecting clients.
 // Release builds stamp the tag over it via -ldflags "-X main.version=…";
 // this default covers source builds (`go build`, `go install`).
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	inv := parseArgs(os.Args[1:])
@@ -39,44 +41,44 @@ func main() {
 	case cmdQuery:
 		runQuery(".", inv.query)
 	case "index":
-		dir := "."
-		if len(inv.args) > 0 {
-			dir = inv.args[0]
+		dir, asJSON, err := parseIndexArgs(inv.args)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(os.Stderr, "usage: descry index [-json] [dir]")
+			os.Exit(2)
 		}
-		runIndex(dir)
+		runIndex(dir, asJSON)
 	case "status":
 		runStatus(".")
 	case "doctor":
-		dir := "."
-		if len(inv.args) > 0 {
-			dir = inv.args[0]
-		}
+		dir := positional(inv, ".", "descry doctor [dir]")
 		runDoctor(dir)
 	case "search":
-		if len(inv.args) == 0 {
-			fmt.Fprintln(os.Stderr, "usage: descry search <query>")
+		dir, query, n, spans, err := parseSearchArgs(inv.args)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(os.Stderr, "usage: descry search [-n <results>] [-spans <per-file>] [-C <dir>] <query>")
 			os.Exit(2)
 		}
-		runSearch(".", strings.Join(inv.args, " "))
+		runSearchN(dir, query, n, spans)
 	case "graph":
 		dir, mode := ".", "auto"
 		for _, a := range inv.args {
-			switch a {
-			case "--typed":
+			switch {
+			case a == "--typed":
 				mode = "typed"
-			case "--named":
+			case a == "--named":
 				mode = "named"
+			case isFlag(a):
+				fmt.Fprintf(os.Stderr, "descry graph: unknown flag %q\nusage: descry graph [--typed|--named] [dir]\n", a)
+				os.Exit(2)
 			default:
 				dir = a
 			}
 		}
 		runGraph(dir, mode)
 	case "eval":
-		set := "eval_queries.json"
-		if len(inv.args) > 0 {
-			set = inv.args[0]
-		}
-		runEval(".", set)
+		runEval(".", positional(inv, "eval_queries.json", "descry eval [query-set.json]"))
 	case "skill":
 		sub := ""
 		if len(inv.args) > 0 {
@@ -86,10 +88,7 @@ func main() {
 	case "mcp":
 		// An explicit root pins the server to one repository. Left empty, the
 		// server follows whichever project the client has open (MCP roots).
-		root := os.Getenv("DESCRY_ROOT")
-		if len(inv.args) > 0 {
-			root = inv.args[0]
-		}
+		root := positional(inv, os.Getenv("DESCRY_ROOT"), "descry mcp [dir]")
 		runMCP(root)
 	case cmdHelp:
 		usage()
@@ -97,6 +96,52 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// parseIndexArgs reads `descry index`'s optional flag and directory. Pure, so
+// the argument handling is testable without indexing anything — which matters
+// here more than usual, because the failure being guarded is one that *writes*:
+// an unrecognised flag used to be taken as a path, and descry would create that
+// directory and leave an index inside it.
+func parseIndexArgs(args []string) (dir string, asJSON bool, err error) {
+	for _, a := range args {
+		switch {
+		case a == "-json" || a == "--json":
+			asJSON = true
+		case isFlag(a):
+			return "", false, fmt.Errorf("descry index: unknown flag %q", a)
+		case dir == "":
+			dir = a
+		default:
+			return "", false, fmt.Errorf("descry index: unexpected argument %q", a)
+		}
+	}
+	if dir == "" {
+		dir = "."
+	}
+	return dir, asJSON, nil
+}
+
+// isFlag reports whether an argument is meant as a flag rather than a path.
+//
+// It exists because these subcommands take an optional positional path, and a
+// path is a thing descry will happily *create*: before this, `descry index
+// --verbose` did not report an unknown flag, it indexed a new directory called
+// "--verbose" and left an index inside it. A leading dash is never a path a
+// user meant, so it is an error rather than a filename.
+func isFlag(a string) bool { return strings.HasPrefix(a, "-") && a != "-" }
+
+// positional reads a subcommand's single optional argument, rejecting flags and
+// extra arguments instead of silently using one and discarding the rest.
+func positional(inv invocation, def, usage string) string {
+	if len(inv.args) == 0 {
+		return def
+	}
+	if len(inv.args) > 1 || isFlag(inv.args[0]) {
+		fmt.Fprintf(os.Stderr, "descry: unexpected argument %q\nusage: %s\n", inv.args[0], usage)
+		os.Exit(2)
+	}
+	return inv.args[0]
 }
 
 // The verb-first dispatch: bare `descry` reports (or offers to build) the
@@ -153,8 +198,36 @@ func parseArgs(args []string) invocation {
 // the code rather than with whatever directory a command happened to run in.
 const indexDirName = ".descry"
 
+// indexDirEnv relocates the index and its embed cache out of the repository.
+//
+// The default — a .descry directory inside the repository — is right for a user:
+// the index travels with the code and there is nothing to configure. It is wrong
+// for anything that must leave the tree it reads untouched, and a retrieval
+// benchmark is exactly that: it scores pinned checkouts that have to stay
+// byte-identical between engines and between runs, and a tool that writes into
+// the corpus it is being measured on has changed the thing under measurement.
+const indexDirEnv = "DESCRY_INDEX_DIR"
+
 // dbPathFor returns the index database path for a repository root.
-func dbPathFor(root string) string { return filepath.Join(root, indexDirName, "index.db") }
+//
+// Under DESCRY_INDEX_DIR the index still gets a directory of its own, keyed by
+// the root it describes. Sharing one directory between two repositories would
+// not merely mix them: an index whose fingerprint no longer matches is *cleared*
+// on open, so two roots pointed at one path would erase each other's work on
+// every alternation. Keying by root makes that unrepresentable rather than
+// documented.
+func dbPathFor(root string) string {
+	dir, ok := os.LookupEnv(indexDirEnv)
+	if !ok || strings.TrimSpace(dir) == "" {
+		return filepath.Join(root, indexDirName, "index.db")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = root
+	}
+	sum := sha256.Sum256([]byte(abs))
+	return filepath.Join(dir, filepath.Base(abs)+"-"+hex.EncodeToString(sum[:4]), "index.db")
+}
 
 // openPipeline opens the persistent SQLite index and wires it into a pipeline.
 // The caller must Close the returned store.
@@ -162,24 +235,58 @@ func dbPathFor(root string) string { return filepath.Join(root, indexDirName, "i
 // (smarter chunking, better tokenization, a new graph, etc.). Bumping it changes
 // the index fingerprint, which transparently rebuilds every user's index on their
 // next run. Record what each bump changed in the README provenance table.
-const pipelineVersion = 3
+const pipelineVersion = 4
+
+const (
+	modelEnv = "DESCRY_MODEL"
+
+	// chunkerEnv names the chunking strategy, empty meaning the shipped default.
+	//
+	// It exists so descry can be *benchmarked as a binary*: measuring one chunker
+	// against another needs two runs that differ in exactly one thing, and an
+	// external harness can only vary what the CLI exposes. This is the same
+	// mechanism DESCRY_MODEL gives the embedder, for the same reason.
+	//
+	// It is safe to flip because the chunker's ID is part of the index
+	// fingerprint: a different chunker is a different index, cleared and rebuilt
+	// on open rather than silently mixed with the previous one's chunks. That is
+	// also why this is a runtime variable and not a build tag — one binary can
+	// serve both arms of a comparison, and cannot serve stale chunks into either.
+	chunkerEnv = "DESCRY_CHUNKER"
+)
+
+// selectChunker resolves the chunking strategy. Unset gives the shipped default;
+// a name that no strategy answers to is an error rather than a silent fallback,
+// because a benchmark arm that quietly measured the default instead of what it
+// asked for would report a difference of zero and look like a finding.
+func selectChunker() (chunk.Chunker, error) {
+	name := strings.TrimSpace(os.Getenv(chunkerEnv))
+	chk, err := chunk.ByName(name)
+	if err != nil {
+		return nil, fmt.Errorf("$%s: %w", chunkerEnv, err)
+	}
+	return chk, nil
+}
 
 func openPipeline(root string) (*index.Pipeline, *store.SQLiteStore, error) {
 	dbPath := dbPathFor(root)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, nil, fmt.Errorf("create index dir: %w", err)
 	}
-	chk := chunk.NewASTChunker() // AST chunking, with a LineChunker fallback
+	chk, err := selectChunker()
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Semantic embeddings via all-MiniLM-L6-v2 on ONNX Runtime. DESCRY_MODEL=q8
 	// swaps in the int8-quantized export; its distinct embedder ID gives it its
 	// own fingerprint and cache keyspace, so switching back and forth is a
 	// (cache-warm) rebuild, never a corruption.
-	modelPath, vocabPath, embedderID, err := embed.EnsureModel(os.Getenv("DESCRY_MODEL"))
+	modelPath, vocabPath, embedderID, dim, pool, err := embed.EnsureModel(os.Getenv(modelEnv))
 	if err != nil {
 		return nil, nil, err
 	}
-	onnx, err := embed.NewOrtEmbedderID(modelPath, vocabPath, embedderID)
+	onnx, err := embed.NewOrtEmbedderID(modelPath, vocabPath, embedderID, dim, pool)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -316,6 +423,12 @@ func buildHybrid(p *index.Pipeline, lex *search.BM25) *search.Hybrid {
 	if v, ok := envFloat("DESCRY_FUSE_ALPHA"); ok {
 		h.FuseAlpha = v
 	}
+	// Hybrid.Rerank is deliberately left nil here. A cross-encoder was built and
+	// measured against this exact code path and made retrieval worse on every
+	// corpus tried, so the CLI does not offer a
+	// switch for it — an opt-in flag that degrades search is a trap, not a
+	// feature. The mechanism survives for the harness, which is what has to be
+	// able to reproduce that row.
 	return h
 }
 
@@ -388,8 +501,27 @@ func envFloat(key string) (float64, bool) {
 	return v, true
 }
 
+// indexReport is the machine-readable result of `descry index -json`: one
+// object on stdout, the same three keys on every path, so a caller never has to
+// branch on which one it got. Files is null when the index was reused, because
+// that number is not known without a walk the run deliberately skipped.
+type indexReport struct {
+	Files  *int `json:"files"`
+	Chunks int  `json:"chunks"`
+	Reused bool `json:"reused"`
+}
+
+func writeIndexJSON(files *int, chunks int, reused bool) {
+	json.NewEncoder(os.Stdout).Encode(indexReport{Files: files, Chunks: chunks, Reused: reused})
+}
+
 // runIndex indexes dir, writing the index into dir/.descry.
-func runIndex(dir string) {
+//
+// asJSON replaces the human summary with one object on stdout. A benchmark
+// harness charges a tool for what it indexed, and can only learn that from what
+// the tool prints; prose is not a reporting interface. Everything conversational
+// moves to stderr under this flag so stdout stays a single parseable object.
+func runIndex(dir string, asJSON bool) {
 	p, s, err := openPipeline(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open error:", err)
@@ -400,6 +532,15 @@ func runIndex(dir string) {
 	if s.Len() > 0 {
 		// Name index.db specifically: deleting the whole .descry dir also
 		// deletes embed_cache.db, which is what makes a rebuild nearly free.
+		if asJSON {
+			// A warm index is still an answer to "what is indexed here". The file
+			// count is not knowable without re-walking the tree, so it is reported
+			// as null — the one honest value. Reporting 0 would be a lie a caller
+			// could not distinguish from an empty repository, and omitting the key
+			// would make the warm and cold outputs different shapes.
+			writeIndexJSON(nil, s.Len(), true)
+			return
+		}
 		fmt.Printf("index already has %d chunks in %s\n", s.Len(), dbPathFor(dir))
 		fmt.Printf("to rebuild, delete that index.db file — keep embed_cache.db beside it, its cached vectors make the rebuild fast\n")
 		return
@@ -414,6 +555,10 @@ func runIndex(dir string) {
 	fmt.Fprintln(os.Stderr, "building lexical indexes")
 	loadOrBuildBM25(s, store.LexicalChunks) // do both now, so the first search is fast
 	loadOrBuildBM25(s, store.LexicalFiles)
+	if asJSON {
+		writeIndexJSON(&files, s.Len(), false)
+		return
+	}
 	fmt.Printf("indexed %d files, %d chunks into %s\n", files, s.Len(), dbPathFor(dir))
 	nudgeSkill()
 }
@@ -468,7 +613,7 @@ func runHome(dir string) {
 			fmt.Fprintln(os.Stderr, "not indexing — run `descry index` when ready")
 			return
 		}
-		runIndex(dir)
+		runIndex(dir, false)
 		return
 	}
 
@@ -555,7 +700,72 @@ func runStatus(root string) {
 	fmt.Printf("%d chunks indexed in %s\n", s.Len(), dbPath)
 }
 
-func runSearch(dir, query string) {
+// parseSearchArgs reads the flags `descry search` accepts, leaving everything
+// else as the query.
+//
+// Flags live on the `search` subcommand rather than on the bare verb form
+// deliberately: `descry <anything>` treats every argument as query text, so a
+// flag there would either be swallowed into the query or would make one-word
+// queries beginning with a dash unsearchable. Behind the reserved subcommand
+// there is no such ambiguity.
+//
+// They exist so the retrieval-benchmark harness can drive descry as an ordinary
+// binary — asking for the cutoff and the spans-per-file setting a protocol
+// specifies, rather than the two defaults tuned for a terminal. A tool that
+// cannot be asked those questions cannot be compared with one that can.
+func parseSearchArgs(args []string) (dir, query string, n, spans int, err error) {
+	dir, n, spans = ".", 10, searchSpansPerFile
+	var words []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		// Everything after `--` is query text. Without it a query beginning with
+		// a flag name is unsearchable: the flag parser would claim the word and
+		// then complain about the rest of the sentence as its value.
+		if a == "--" {
+			words = append(words, args[i+1:]...)
+			break
+		}
+		need := func() (string, error) {
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("%s needs a value", a)
+			}
+			i++
+			return args[i], nil
+		}
+		var v string
+		switch a {
+		case "-n", "--n":
+			if v, err = need(); err != nil {
+				return
+			}
+			if n, err = strconv.Atoi(v); err != nil || n <= 0 {
+				return "", "", 0, 0, fmt.Errorf("-n needs a positive integer")
+			}
+		case "-spans", "--spans":
+			if v, err = need(); err != nil {
+				return
+			}
+			if spans, err = strconv.Atoi(v); err != nil || spans <= 0 {
+				return "", "", 0, 0, fmt.Errorf("-spans needs a positive integer")
+			}
+		case "-C", "--dir":
+			if dir, err = need(); err != nil {
+				return
+			}
+		default:
+			words = append(words, a)
+		}
+	}
+	query = strings.TrimSpace(strings.Join(words, " "))
+	if query == "" {
+		return "", "", 0, 0, fmt.Errorf("search needs a query")
+	}
+	return dir, query, n, spans, nil
+}
+
+func runSearch(dir, query string) { runSearchN(dir, query, 10, searchSpansPerFile) }
+
+func runSearchN(dir, query string, topN, spansPerFile int) {
 	p, s, err := openPipeline(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open error:", err)
@@ -569,18 +779,33 @@ func runSearch(dir, query string) {
 		os.Exit(1)
 	}
 
-	// File-level results: one hit per file (its best chunk), which is both what
-	// the eval validates and what a caller scanning results wants.
-	results := h.SearchFiles(query, 10)
+	// File-level results, each showing its best few spans. A second span per
+	// file costs a line of terminal output and buys a mean +10.2pp of chunk
+	// recall over the benchmark — the cheapest
+	// trade on the board, and cheaper here than over MCP because a line range
+	// is not a context window.
+	results := h.SearchFilesN(query, topN, spansPerFile)
 	if len(results) == 0 {
 		fmt.Println("no results")
 		return
 	}
-	for i, r := range results {
-		loc := fmt.Sprintf("%s:%d-%d", r.Chunk.Path, r.Chunk.StartLine, r.Chunk.EndLine)
-		fmt.Printf("%2d. [%.3f] %s\n", i+1, r.Score, loc)
+	for i, fh := range results {
+		for j, c := range fh.Chunks {
+			loc := fmt.Sprintf("%s:%d-%d", c.Path, c.StartLine, c.EndLine)
+			if j == 0 {
+				fmt.Printf("%2d. [%.3f] %s\n", i+1, fh.Score, loc)
+				continue
+			}
+			// Continuation spans are indented under their file rather than
+			// numbered, so the list still reads as one entry per file.
+			fmt.Printf("            %s\n", loc)
+		}
 	}
 }
+
+// searchSpansPerFile is how many spans of a file `descry search` lists. See
+// mcp.defaultChunksPerFile for why two.
+const searchSpansPerFile = 2
 
 func runEval(root, querySetPath string) {
 	p, s, err := openPipeline(root)
@@ -716,8 +941,8 @@ func runMCP(root string) {
 func openWorkspace(root string, progress func(phase string, done, total int)) (*mcp.Workspace, error) {
 	p, s, err := openPipeline(root)
 	if err != nil {
-		return nil, fmt.Errorf("open index for %s (descry writes to <root>/%s, which must be writable): %w",
-			root, indexDirName, err)
+		return nil, fmt.Errorf("open index for %s (descry writes to %s, which must be writable): %w",
+			root, filepath.Dir(dbPathFor(root)), err)
 	}
 
 	if s.Len() == 0 { // readyHybrid will build the index; announce and wire progress
@@ -746,7 +971,10 @@ func openWorkspace(root string, progress func(phase string, done, total int)) (*
 	fmt.Fprintf(os.Stderr, "descry: serving %s (%d chunks)\n", root, s.Len())
 
 	return &mcp.Workspace{
-		Search:    h.SearchFiles, // one hit per file — the benchmarked retrieval surface
+		// The benchmarked retrieval surface: the file ranking is exactly
+		// SearchFiles', and perFile only decides how much of each file comes
+		// back with it.
+		Search:    h.SearchFilesN,
 		Chunks:    s.Len,
 		IndexPath: dbPathFor(root),
 		BuildGraph: func() (*graph.Graph, error) {
@@ -776,7 +1004,7 @@ usage:
   descry status          report how many chunks are indexed
   descry doctor [dir]    health-check the runtime, model, index and agent skill
                          (read-only; exits 1 if something is broken)
-  descry search <query>  explicit search; indexes a cold repo without asking (script-friendly)
+  descry search [-n N] [-spans N] [-C dir] <query>  explicit search; indexes a cold repo without asking (script-friendly)
   descry graph [dir] [--typed|--named]  print the call graph as Mermaid (default: typed, falls back to name-based)
   descry eval [queryset.json]   score retrieval (Recall@k, MRR) vs a labeled set
   descry mcp [dir]       serve over MCP (JSON-RPC on stdio); without dir, follows

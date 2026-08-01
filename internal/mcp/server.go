@@ -28,8 +28,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/jKiler/descry/internal/core"
 	"github.com/jKiler/descry/internal/graph"
+	"github.com/jKiler/descry/internal/search"
 	"github.com/jKiler/descry/internal/skill"
 )
 
@@ -38,8 +38,17 @@ const serverName = "descry"
 // Workspace is one opened, searchable repository — everything the tools need to
 // answer for a single root directory.
 type Workspace struct {
-	// Search returns ranked hybrid-search results for a query.
-	Search func(query string, k int) []core.SearchResult
+	// Search returns the top k files for a query, each carrying up to perFile
+	// of its best-matching chunks.
+	//
+	// perFile is a parameter because it is the single largest measured lever on
+	// what a caller actually receives: over all seven benchmark corpora, showing
+	// two chunks per file instead of one lifts chunk recall a mean +10.2pp, and
+	// three lifts it +15.9pp. It is not a
+	// retrieval improvement — nothing ranks better — it is the agent choosing
+	// to spend context on more of a file that already ranked, which at a fixed
+	// budget beats spending the same context on more files.
+	Search func(query string, k, perFile int) []search.FileHit
 	// Chunks reports how many chunks are indexed.
 	Chunks func() int
 	// IndexPath is where the index database lives.
@@ -565,26 +574,50 @@ func resolveSymbol(g *graph.Graph, name string) (id string, matches []string, ms
 
 const defaultK = 10
 
+// defaultChunksPerFile is how many pieces of each matching file a tool returns.
+//
+// Two, not one, and the reason is measured. descry's failure mode is not
+// finding the wrong file — the right file ranks in the top 10 for 465 of the
+// benchmark's 523 queries — it is showing the wrong part of the right one, and
+// three separate attempts to fix that by picking a better single chunk all
+// failed. Showing two pieces instead of one
+// buys a mean +10.2pp of chunk recall for 1.9x the tokens, and beats spending
+// the same tokens on twice as many files by a mean +8.3pp.
+//
+// Two rather than three because the second piece is where the exchange rate is
+// best; three is available to a caller who wants it and knows what it costs.
+const defaultChunksPerFile = 2
+
 // query runs a search and maps the results into the tool output, optionally
 // including each chunk's source content (read_relevant).
+//
+// A file's pieces come back as consecutive hits sharing a path, best first, so
+// the shape of a result is unchanged for any caller that was already reading a
+// flat list. k counts *files*, not hits.
 func query(w *Workspace, in searchInput, withContent bool) searchOutput {
 	k := in.K
 	if k <= 0 {
 		k = defaultK
 	}
+	perFile := in.ChunksPerFile
+	if perFile <= 0 {
+		perFile = defaultChunksPerFile
+	}
 	var out searchOutput
-	for _, r := range w.Search(in.Query, k) {
-		h := hit{
-			Path:      r.Chunk.Path,
-			StartLine: r.Chunk.StartLine,
-			EndLine:   r.Chunk.EndLine,
-			Symbol:    r.Chunk.Symbol,
-			Score:     r.Score,
+	for _, fh := range w.Search(in.Query, k, perFile) {
+		for _, c := range fh.Chunks {
+			h := hit{
+				Path:      c.Path,
+				StartLine: c.StartLine,
+				EndLine:   c.EndLine,
+				Symbol:    c.Symbol,
+				Score:     fh.Score,
+			}
+			if withContent {
+				h.Content = c.Content
+			}
+			out.Hits = append(out.Hits, h)
 		}
-		if withContent {
-			h.Content = r.Chunk.Content
-		}
-		out.Hits = append(out.Hits, h)
 	}
 	return out
 }
@@ -599,7 +632,11 @@ type rootArg struct {
 type searchInput struct {
 	rootArg
 	Query string `json:"query" jsonschema:"the natural-language or keyword search query"`
-	K     int    `json:"k,omitempty" jsonschema:"maximum number of results to return (default 10)"`
+	K     int    `json:"k,omitempty" jsonschema:"maximum number of FILES to return (default 10); each may contribute more than one hit"`
+	// ChunksPerFile is exposed because it is a context-budget decision the
+	// caller is better placed to make than descry is: an agent with room to
+	// read should raise it, one assembling a large prompt should lower it.
+	ChunksPerFile int `json:"chunks_per_file,omitempty" jsonschema:"how many pieces of each matching file to return (default 2); 1 is the narrowest, 3 recalls more and costs proportionally more tokens"`
 }
 
 type hit struct {

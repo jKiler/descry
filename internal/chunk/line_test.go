@@ -27,8 +27,9 @@ func TestLineChunker_SplitsOnBlankLines(t *testing.T) {
 	if got[0].Path != "a.txt" {
 		t.Errorf("path = %q, want a.txt", got[0].Path)
 	}
-	if got[0].ID != "a.txt#1" {
-		t.Errorf("id = %q, want a.txt#1", got[0].ID)
+	// Ids are content-keyed, so they survive edits elsewhere in the file.
+	if want := IDFor("a.txt", got[0].Content, nil); got[0].ID != want {
+		t.Errorf("id = %q, want %q", got[0].ID, want)
 	}
 }
 

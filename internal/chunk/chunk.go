@@ -16,3 +16,13 @@ type Chunker interface {
 	// the stored data, so it feeds the reindex fingerprint.
 	ID() string
 }
+
+// Diagnostic is the optional half of Chunker: it reports which strategy
+// actually cut a file. A chunker that delegates (to a language pack, or to the
+// fallback) implements this so the evaluation harness can attribute a chunk to
+// the code that produced it — otherwise a fallback silently swallowing a whole
+// language looks identical to that language working.
+type Diagnostic interface {
+	Chunker
+	ChunkFile(path, content string) (chunks []core.Chunk, strategy string)
+}

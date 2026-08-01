@@ -14,6 +14,7 @@ import (
 
 	"github.com/jKiler/descry/internal/core"
 	"github.com/jKiler/descry/internal/graph"
+	"github.com/jKiler/descry/internal/search"
 )
 
 // testWorkspace is a fixed in-memory workspace, so the server can be exercised
@@ -23,10 +24,18 @@ func testWorkspace(root string) *Workspace {
 	g.AddEdge("A", "B") // A -> B -> C
 	g.AddEdge("B", "C")
 	return &Workspace{
-		Search: func(_ string, _ int) []core.SearchResult {
-			return []core.SearchResult{
-				{Chunk: core.Chunk{Path: "a.go", StartLine: 1, EndLine: 3, Symbol: "Foo", Content: "func Foo() {}"}, Score: 0.9},
-				{Chunk: core.Chunk{Path: "b.go", StartLine: 4, EndLine: 6, Symbol: "Bar", Content: "func Bar() {}"}, Score: 0.5},
+		// a.go carries two spans so the per-file arity is exercised; b.go one,
+		// so a file with nothing more to show still comes back correctly.
+		Search: func(_ string, _, perFile int) []search.FileHit {
+			a := []core.Chunk{
+				{Path: "a.go", StartLine: 1, EndLine: 3, Symbol: "Foo", Content: "func Foo() {}"},
+				{Path: "a.go", StartLine: 20, EndLine: 24, Symbol: "Foo2", Content: "func Foo2() {}"},
+			}
+			return []search.FileHit{
+				{Path: "a.go", Score: 0.9, Chunks: a[:min(perFile, len(a))]},
+				{Path: "b.go", Score: 0.5, Chunks: []core.Chunk{
+					{Path: "b.go", StartLine: 4, EndLine: 6, Symbol: "Bar", Content: "func Bar() {}"},
+				}},
 			}
 		},
 		Chunks:     func() int { return 7 },
@@ -108,8 +117,9 @@ func TestSearchOmitsContent(t *testing.T) {
 
 	var out searchOutput
 	callInto(t, ctx, cs, "search", map[string]any{"query": "foo"}, &out)
-	if len(out.Hits) != 2 {
-		t.Fatalf("hits = %d, want 2", len(out.Hits))
+	// Two files, and a.go contributes both of its spans at the default arity.
+	if len(out.Hits) != 3 {
+		t.Fatalf("hits = %d, want 3 (a.go twice, b.go once)", len(out.Hits))
 	}
 	if out.Root != root {
 		t.Errorf("root = %q, want %q (results must name their repository)", out.Root, root)
@@ -196,8 +206,8 @@ func TestColdRepoReportsIndexingWithoutBlocking(t *testing.T) {
 
 	var out searchOutput
 	callInto(t, ctx, cs, "search", map[string]any{"query": "foo"}, &out)
-	if out.Indexing || len(out.Hits) != 2 {
-		t.Errorf("after indexing finished, search = %+v, want 2 hits", out)
+	if out.Indexing || len(out.Hits) == 0 {
+		t.Errorf("after indexing finished, search = %+v, want results", out)
 	}
 }
 
@@ -378,5 +388,57 @@ func TestGraphNotBuiltForSearchOnly(t *testing.T) {
 
 	if n := graphBuilds.Load(); n != 0 {
 		t.Errorf("call graph was built %d times for a search-only session, want 0", n)
+	}
+}
+
+// A file contributes several consecutive hits, best span first. This is the
+// shipped answer to the measured failure mode — the right file
+// ranked, the wrong part of it shown — so it needs a test that would fail if a
+// refactor quietly collapsed a file back to one span.
+func TestSearchReturnsSeveralSpansPerFile(t *testing.T) {
+	ctx, cs := connect(t, &Server{Root: t.TempDir(), Open: instant()})
+	waitReady(t, ctx, cs, map[string]any{})
+
+	var out searchOutput
+	callInto(t, ctx, cs, "search", map[string]any{"query": "foo"}, &out)
+
+	var aSpans []hit
+	for _, h := range out.Hits {
+		if h.Path == "a.go" {
+			aSpans = append(aSpans, h)
+		}
+	}
+	if len(aSpans) != 2 {
+		t.Fatalf("a.go returned %d spans, want 2", len(aSpans))
+	}
+	if aSpans[0].StartLine != 1 || aSpans[1].StartLine != 20 {
+		t.Errorf("spans out of order or wrong: %+v", aSpans)
+	}
+	if aSpans[0].Score != aSpans[1].Score {
+		t.Errorf("spans of one file carry different scores: %v vs %v",
+			aSpans[0].Score, aSpans[1].Score)
+	}
+}
+
+// chunks_per_file is the caller's context-budget dial, so it has to actually
+// reach the workspace rather than being accepted and ignored.
+func TestChunksPerFileIsHonoured(t *testing.T) {
+	ctx, cs := connect(t, &Server{Root: t.TempDir(), Open: instant()})
+	waitReady(t, ctx, cs, map[string]any{})
+
+	for _, tc := range []struct{ perFile, wantA int }{{1, 1}, {2, 2}, {3, 2}} {
+		var out searchOutput
+		callInto(t, ctx, cs, "read_relevant",
+			map[string]any{"query": "foo", "chunks_per_file": tc.perFile}, &out)
+		got := 0
+		for _, h := range out.Hits {
+			if h.Path == "a.go" {
+				got++
+			}
+		}
+		if got != tc.wantA {
+			t.Errorf("chunks_per_file=%d: a.go returned %d spans, want %d",
+				tc.perFile, got, tc.wantA)
+		}
 	}
 }

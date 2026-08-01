@@ -25,7 +25,7 @@ func currentFingerprint(t *testing.T) string {
 	t.Helper()
 	return "schema=" + strconv.Itoa(store.SchemaVersion) +
 		" pipeline=" + strconv.Itoa(pipelineVersion) +
-		" embedder=all-MiniLM-L6-v2 dim=384 chunker=" + chunk.NewASTChunker().ID()
+		" embedder=all-MiniLM-L6-v2 dim=384 chunker=" + chunk.Default().ID()
 }
 
 func TestParseFingerprint(t *testing.T) {

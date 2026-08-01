@@ -5,8 +5,8 @@
 # /tmp/descry (a short path, so the index-consent prompt reads well) and puts
 # the freshly built ./descry on PATH — the recording never shows untracked
 # local files and reproduces from any checkout. The recording then shows the
-# real cold start: first query prompts for consent, indexes with live
-# progress, and answers; the second query answers from the warm index.
+# real cold start: the query prompts for consent, indexes with live progress,
+# and answers; `descry doctor` then reports the whole resolution chain.
 #
 # Honest-timing caveat: the machine recording this already has the embedding
 # model and ONNX Runtime cached at user level. A true first run downloads the
@@ -24,7 +24,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
 Hide
-Type `export PATH="$PWD:$PATH" && rm -rf /tmp/descry && mkdir /tmp/descry && git archive HEAD | tar -x -C /tmp/descry && cd /tmp/descry && clear`
+Type `export PATH="$PWD:$PATH" DESCRY_CHUNKER=ast-go && rm -rf /tmp/descry && mkdir /tmp/descry && git archive HEAD | tar -x -C /tmp/descry && cd /tmp/descry && clear`
 Enter
 Wait
 Show
@@ -41,8 +41,8 @@ Enter
 Wait@2m
 Sleep 3.5s
 
-# Warm index: the second query answers instantly.
-Type `descry who decides when a file needs re-embedding`
+# The resolution chain, reported at once: cgo, runtime, model, index, skill.
+Type `descry doctor`
 Sleep 600ms
 Enter
 Sleep 5s

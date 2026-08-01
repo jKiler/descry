@@ -68,27 +68,36 @@ func LoadWordPiece(path string, maxLen int) (*WordPiece, error) {
 	return wp, nil
 }
 
-// Encode turns text into the model's input tensors.
+// Encode turns text into the model's input tensors: [CLS] text [SEP],
+// truncated to maxLen.
 func (w *WordPiece) Encode(text string) Encoding {
-	ids := []int64{w.clsID}
-	budget := w.maxLen - 2 // room for [CLS] and [SEP]
-encode:
-	for _, word := range basicTokenize(text) {
-		for _, id := range w.subword(word) {
-			if budget == 0 {
-				break encode
-			}
-			ids = append(ids, id)
-			budget--
-		}
+	body := w.pieces(text)
+	if n := w.maxLen - 2; len(body) > n { // room for [CLS] and [SEP]
+		body = body[:n]
 	}
+	ids := make([]int64, 0, len(body)+2)
+	ids = append(ids, w.clsID)
+	ids = append(ids, body...)
 	ids = append(ids, w.sepID)
+	return Encoding{IDs: ids, Mask: ones(len(ids)), TypeIDs: make([]int64, len(ids))}
+}
 
-	mask := make([]int64, len(ids))
-	for i := range mask {
-		mask[i] = 1
+// pieces expands text into wordpiece ids, unbounded — callers apply their own
+// length policy, which differs between a single text and a pair.
+func (w *WordPiece) pieces(text string) []int64 {
+	var ids []int64
+	for _, word := range basicTokenize(text) {
+		ids = append(ids, w.subword(word)...)
 	}
-	return Encoding{IDs: ids, Mask: mask, TypeIDs: make([]int64, len(ids))}
+	return ids
+}
+
+func ones(n int) []int64 {
+	m := make([]int64, n)
+	for i := range m {
+		m[i] = 1
+	}
+	return m
 }
 
 // subword splits one basic token into wordpiece ids by greedy longest-match:

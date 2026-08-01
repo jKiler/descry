@@ -22,6 +22,8 @@ type modelSpec struct {
 	sha256 string // "" = unpinned (the fp32 default tracks the repo's main revision)
 	file   string
 	id     string
+	dim    int     // the export's hidden size, and so the stored vector width
+	pool   Pooling // the pooling recipe the model was trained with
 }
 
 // modelSpecs maps DESCRY_MODEL values to exports. "" is the fp32 default (ONNX
@@ -34,12 +36,16 @@ var modelSpecs = map[string]modelSpec{
 		url:  "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx",
 		file: "all-MiniLM-L6-v2.onnx",
 		id:   "all-MiniLM-L6-v2",
+		dim:  384,
+		pool: PoolMean,
 	},
 	"q8": {
 		url:    "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/onnx/model_quantized.onnx",
 		sha256: "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1",
 		file:   "all-MiniLM-L6-v2-q8.onnx",
 		id:     "all-MiniLM-L6-v2-q8",
+		dim:    384,
+		pool:   PoolMean,
 	},
 }
 
@@ -47,7 +53,9 @@ var modelSpecs = map[string]modelSpec{
 // without downloading. Cached reports whether both files are already present —
 // the difference between an instant first index and a ~90MB download.
 type ModelState struct {
-	ID          string // embedder identity for the model's vector space
+	ID          string  // embedder identity for the model's vector space
+	Dim         int     // the export's hidden size
+	Pool        Pooling // the pooling recipe the model was trained with
 	ModelPath   string
 	VocabPath   string
 	ModelCached bool
@@ -80,6 +88,8 @@ func LocateModel(name string) (ModelState, error) {
 	dir := filepath.Join(cache, "descry", "models")
 	st := ModelState{
 		ID:        spec.id,
+		Dim:       spec.dim,
+		Pool:      spec.pool,
 		ModelPath: filepath.Join(dir, spec.file),
 		VocabPath: filepath.Join(dir, "vocab.txt"),
 		URL:       spec.url,
@@ -101,25 +111,25 @@ func LocateModel(name string) (ModelState, error) {
 // exports are sha256-verified, and a mismatched file is deleted and rejected.
 // The returned id is the embedder identity for the model's vector space (see
 // NewOrtEmbedderID). Use LocateModel to inspect this without downloading.
-func EnsureModel(name string) (modelPath, vocabPath, id string, err error) {
+func EnsureModel(name string) (modelPath, vocabPath, id string, dim int, pool Pooling, err error) {
 	st, err := LocateModel(name)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", 0, "", err
 	}
 	modelPath, vocabPath = st.ModelPath, st.VocabPath
 	if err := downloadOnce(st.URL, modelPath); err != nil {
-		return "", "", "", fmt.Errorf("fetch model: %w", err)
+		return "", "", "", 0, "", fmt.Errorf("fetch model: %w", err)
 	}
 	if st.sha256 != "" {
 		if err := verifySHA256(modelPath, st.sha256); err != nil {
 			os.Remove(modelPath)
-			return "", "", "", fmt.Errorf("model integrity: %w", err)
+			return "", "", "", 0, "", fmt.Errorf("model integrity: %w", err)
 		}
 	}
 	if err := downloadOnce(minilmVocabURL, vocabPath); err != nil {
-		return "", "", "", fmt.Errorf("fetch vocab: %w", err)
+		return "", "", "", 0, "", fmt.Errorf("fetch vocab: %w", err)
 	}
-	return modelPath, vocabPath, st.ID, nil
+	return modelPath, vocabPath, st.ID, st.Dim, st.Pool, nil
 }
 
 // verifySHA256 checks a file against an expected hex digest.

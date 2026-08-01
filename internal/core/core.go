@@ -15,6 +15,30 @@ type Chunk struct {
 	Symbol    string    // function/class/section name, "" if none
 	Content   string    // the raw text of the chunk
 	Vector    []float32 // filled in after embedding; nil until then
+
+	// EmbedText is the enriched representation the *embedder* sees: language,
+	// module path, qualified symbol, and signature, followed by the source. It
+	// exists because the two audiences want different things — a sentence
+	// embedder needs the naming context that makes a bare function body
+	// ambiguous, while an agent reading a result back wants clean source with
+	// nothing interpolated. Content is that clean source.
+	//
+	// Not persisted: only the vector derived from it is. A chunk loaded from the
+	// index therefore has an empty EmbedText, which is correct, because it is
+	// never re-embedded without being re-chunked first. Empty means "fall back
+	// to the path header", so chunkers that do not enrich keep working.
+	EmbedText string
+
+	// StartByte and EndByte are the chunk's exact half-open span in the file it
+	// came from. Line numbers are what a reader wants and what the index stores,
+	// but they are ambiguous at a boundary: a chunk beginning immediately after
+	// a declaration ends shares that declaration's last line, and cannot be told
+	// apart from one that cuts into it. The structural-integrity check needs
+	// that distinction, so the chunker reports where the cut actually fell.
+	//
+	// Not persisted, for the same reason as EmbedText: only a freshly chunked
+	// file has anything to check.
+	StartByte, EndByte int
 }
 
 // SearchResult pairs a chunk with the score a retriever gave it.

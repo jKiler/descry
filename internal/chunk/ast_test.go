@@ -71,8 +71,9 @@ func TestASTChunker_SplitsOnDeclarations(t *testing.T) {
 	if got[0].Path != "sample.go" {
 		t.Errorf("path = %q, want sample.go", got[0].Path)
 	}
-	if got[1].ID != "sample.go#8" {
-		t.Errorf("chunk1 id = %q, want sample.go#8", got[1].ID)
+	// Ids are content-keyed, so they survive edits elsewhere in the file.
+	if want := IDFor("sample.go", got[1].Content, nil); got[1].ID != want {
+		t.Errorf("chunk1 id = %q, want %q", got[1].ID, want)
 	}
 }
 

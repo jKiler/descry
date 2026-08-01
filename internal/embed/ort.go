@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	onnxDim       = 384
+	// minilmDim is the width of the default MiniLM export, and the width
+	// NewOrtEmbedder assumes. Other exports declare their own — see modelSpec.
+	minilmDim     = 384
 	onnxMaxTokens = 256 // plenty for declaration-sized AST chunks
 )
 
@@ -52,19 +54,37 @@ type OrtEmbedder struct {
 	session *ort.DynamicAdvancedSession
 	tok     *WordPiece
 	id      string
+	dim     int
+	pool    Pooling
 }
+
+// Pooling names how a model's token vectors collapse into one sentence vector.
+// It belongs to the model, not to descry: see clsPool.
+type Pooling string
+
+const (
+	PoolMean Pooling = "mean" // sentence-transformers recipe (MiniLM)
+	PoolCLS  Pooling = "cls"  // BERT [CLS] token (the BGE family)
+)
 
 // NewOrtEmbedder loads the fp32 MiniLM graph and runs a warm-up inference, so a
 // missing or broken native library fails loudly here rather than mid-index.
 func NewOrtEmbedder(modelPath, vocabPath string) (*OrtEmbedder, error) {
-	return NewOrtEmbedderID(modelPath, vocabPath, "all-MiniLM-L6-v2")
+	return NewOrtEmbedderID(modelPath, vocabPath, "all-MiniLM-L6-v2", minilmDim, PoolMean)
 }
 
-// NewOrtEmbedderID loads an ONNX model under an explicit embedder identity.
-// Use a distinct id for any file that is not vector-identical to the fp32
-// default (e.g. the q8 quantized export) — the id feeds the index fingerprint
-// and the embed-cache key, and mixing vector spaces under one id corrupts both.
-func NewOrtEmbedderID(modelPath, vocabPath, id string) (*OrtEmbedder, error) {
+// NewOrtEmbedderID loads an ONNX model under an explicit embedder identity and
+// output width. Use a distinct id for any file that is not vector-identical to
+// the fp32 default (e.g. the q8 quantized export) — the id feeds the index
+// fingerprint and the embed-cache key, and mixing vector spaces under one id
+// corrupts both.
+//
+// dim must match the model's hidden size and pool must be the recipe the model
+// was trained with. Both are parameters rather than constants because comparing
+// a candidate model against the shipped one is a routine question ("is a bigger
+// encoder worth the index time?"), and hardcoding either turns that experiment
+// into a refactor — or, worse, into a measurement of the wrong thing.
+func NewOrtEmbedderID(modelPath, vocabPath, id string, dim int, pool Pooling) (*OrtEmbedder, error) {
 	tok, err := LoadWordPiece(vocabPath, onnxMaxTokens)
 	if err != nil {
 		return nil, fmt.Errorf("load vocab: %w", err)
@@ -89,7 +109,7 @@ func NewOrtEmbedderID(modelPath, vocabPath, id string) (*OrtEmbedder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load model: %w", err)
 	}
-	e := &OrtEmbedder{session: session, tok: tok, id: id}
+	e := &OrtEmbedder{session: session, tok: tok, id: id, dim: dim, pool: pool}
 	if _, err := e.embed("warm up"); err != nil {
 		session.Destroy()
 		return nil, fmt.Errorf("model warm-up: %w", err)
@@ -98,7 +118,7 @@ func NewOrtEmbedderID(modelPath, vocabPath, id string) (*OrtEmbedder, error) {
 }
 
 // Dim reports the model's embedding width.
-func (e *OrtEmbedder) Dim() int { return onnxDim }
+func (e *OrtEmbedder) Dim() int { return e.dim }
 
 // ID reports the embedder identity set at construction, which feeds the index
 // fingerprint and the embed-cache key. The fp32 default keeps the historical id
@@ -149,11 +169,14 @@ func (e *OrtEmbedder) embed(text string) ([]float32, error) {
 	}
 	defer out.Destroy()
 	data := out.GetData()
-	if len(data) != int(n)*onnxDim {
-		return nil, fmt.Errorf("unexpected output length %d, want %d", len(data), int(n)*onnxDim)
+	if len(data) != int(n)*e.dim {
+		return nil, fmt.Errorf("unexpected output length %d, want %d", len(data), int(n)*e.dim)
 	}
-	// meanPool copies into a fresh slice, so freeing the tensor after is safe.
-	return l2norm(meanPool(data, enc.Mask, onnxDim)), nil
+	// Both poolers copy into a fresh slice, so freeing the tensor after is safe.
+	if e.pool == PoolCLS {
+		return l2norm(clsPool(data, e.dim)), nil
+	}
+	return l2norm(meanPool(data, enc.Mask, e.dim)), nil
 }
 
 // Close releases the ORT session.
@@ -170,7 +193,7 @@ func NewSemanticEmbedder(modelPath, vocabPath string) (Embedder, error) {
 // (README "Measured quality"). It runs under its own identity so its vector
 // space never mixes with fp32's.
 func NewSemanticEmbedderQ8(modelPath, vocabPath string) (Embedder, error) {
-	return NewOrtEmbedderID(modelPath, vocabPath, "all-MiniLM-L6-v2-q8")
+	return NewOrtEmbedderID(modelPath, vocabPath, "all-MiniLM-L6-v2-q8", minilmDim, PoolMean)
 }
 
 var _ Embedder = (*OrtEmbedder)(nil)

@@ -44,11 +44,11 @@ func TestSemanticEmbedder(t *testing.T) {
 	}
 
 	t.Run("dimension", func(t *testing.T) {
-		if e.Dim() != onnxDim {
-			t.Errorf("Dim() = %d, want %d", e.Dim(), onnxDim)
+		if e.Dim() != minilmDim {
+			t.Errorf("Dim() = %d, want %d", e.Dim(), minilmDim)
 		}
-		if got := len(e.Embed("hello world")); got != onnxDim {
-			t.Errorf("embedding width = %d, want %d", got, onnxDim)
+		if got := len(e.Embed("hello world")); got != minilmDim {
+			t.Errorf("embedding width = %d, want %d", got, minilmDim)
 		}
 	})
 
@@ -103,8 +103,8 @@ func TestOrtQ8DistinctSpace(t *testing.T) {
 
 	text := "rank documents by keyword relevance"
 	qv, fv := q8.Embed(text), fp32.Embed(text)
-	if len(qv) != onnxDim {
-		t.Fatalf("q8 dim = %d, want %d", len(qv), onnxDim)
+	if len(qv) != minilmDim {
+		t.Fatalf("q8 dim = %d, want %d", len(qv), minilmDim)
 	}
 	var norm float64
 	for _, x := range qv {

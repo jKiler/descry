@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 	"github.com/jKiler/descry/internal/chunk"
 	"github.com/jKiler/descry/internal/core"
 	"github.com/jKiler/descry/internal/embed"
+	"github.com/jKiler/descry/internal/lang"
 	"github.com/jKiler/descry/internal/store"
 )
 
@@ -49,15 +49,15 @@ func New(c chunk.Chunker, e embed.Embedder, s store.Store) *Pipeline {
 	return &Pipeline{Chunker: c, Emb: e, Store: s}
 }
 
-// defaultExts are the file extensions descry indexes.
-var defaultExts = map[string]bool{
-	".go": true, ".ts": true, ".js": true, ".py": true, ".rs": true,
-	".java": true, ".md": true, ".txt": true, ".json": true, ".yaml": true,
-}
+// IndexDir walks root, indexing files whose extension a language pack claims
+// (internal/lang owns that list). Hidden dirs and common vendor/build dirs are
+// skipped.
+func IndexDir(p *Pipeline, root string) (int, error) { return IndexDirRel(p, root, root) }
 
-// IndexDir walks root, indexing files with known extensions. Hidden dirs and
-// common vendor/build dirs are skipped.
-func IndexDir(p *Pipeline, root string) (int, error) {
+// IndexDirRel is IndexDir with the stored paths made relative to base rather
+// than to the walked directory, so a caller can index a subtree while keeping
+// repository-rooted paths. base must be a prefix of root.
+func IndexDirRel(p *Pipeline, root, base string) (int, error) {
 	report := func(phase string, done, total int) {
 		if p.Progress != nil {
 			p.Progress(phase, done, total)
@@ -67,30 +67,7 @@ func IndexDir(p *Pipeline, root string) (int, error) {
 	files := 0
 	var chunks []core.Chunk
 	report(PhaseScanning, 0, 0)
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if name != "." && (strings.HasPrefix(name, ".") ||
-				name == "node_modules" || name == "vendor" || name == "dist") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !defaultExts[strings.ToLower(filepath.Ext(path))] {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil // skip unreadable files rather than abort
-		}
-		rel, _ := filepath.Rel(root, path)
-		content := string(data)
-		if skipFile(rel, content) {
-			return nil
-		}
+	err := WalkFiles(root, base, func(rel, content string) error {
 		chunks = append(chunks, p.Chunker.Chunk(rel, content)...)
 		files++
 		// The tree walk is silent otherwise, and on a large repository it runs
@@ -120,29 +97,117 @@ func IndexDir(p *Pipeline, root string) (int, error) {
 	return files, nil
 }
 
-// generatedMarker is Go's standard generated-code header
-// (https://golang.org/s/generatedcode). It must appear on its own line before
-// the package clause.
-var generatedMarker = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
+// skipDirs are directories no index should descend into: dependency trees and
+// build output, which are neither the user's code nor small.
+var skipDirs = map[string]bool{"node_modules": true, "vendor": true, "dist": true}
+
+// WalkFiles calls fn(rel, content) for every file under root that belongs in an
+// index — a language pack claims its extension, and it is neither test code nor
+// generated. rel is slash-separated and relative to base. Exported so the
+// evaluation harness selects exactly the files the indexer would, instead of
+// re-deriving the rules and drifting from them.
+func WalkFiles(root, base string, fn func(rel, content string) error) error {
+	return filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name != "." && (strings.HasPrefix(name, ".") || skipDirs[name]) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Symlinked files are not followed. os.ReadFile would resolve the link, so
+		// a link named foo.go pointing outside the repository puts content the
+		// caller never offered into their index, and a link to a file already in
+		// the tree indexes it twice. Directory links are already ignored: WalkDir
+		// reports them as non-directories and never descends.
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if lang.ForPath(p) == nil {
+			return nil
+		}
+		// A size cap before the read, because everything downstream is unbounded
+		// in the file's length: the parse, the cover, and — for a file with no
+		// blank lines and no grammar — a single chunk holding all of it. Source
+		// files do not reach this; minified bundles, lockfiles and vendored blobs
+		// do, and they are not what anyone is searching for.
+		if fi, err := d.Info(); err == nil && fi.Size() > maxFileBytes {
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil // skip unreadable files rather than abort
+		}
+		rel, _ := filepath.Rel(base, p)
+		rel = filepath.ToSlash(rel)
+		content := string(data)
+		if skipFile(rel, content) {
+			return nil
+		}
+		return fn(rel, content)
+	})
+}
+
+// maxFileBytes is the largest file the indexer will read. Chosen well above real
+// source — the largest file in the Kubernetes tree is under 3 MB — so the cap
+// only catches machine-generated bulk.
+const maxFileBytes = 4 << 20
+
+// generatedHeadLines is how far into a file the generated-code marker is looked
+// for. Every convention (Go's `// Code generated ... DO NOT EDIT.`, the
+// `@generated` tag, protoc's banner) puts it in the file's opening comment, so
+// a short window finds them all while a stray "DO NOT EDIT" in real code
+// further down cannot false-positive.
+const generatedHeadLines = 20
 
 // skipFile reports whether a source file should be left out of the index. Test
 // files and generated code (large repos can be ~40% generated conversion/
 // deepcopy) bloat the index and crowd out real results without being what
-// anyone searches for.
+// anyone searches for. Both judgments come from the file's language pack
+// (internal/lang), so a new language brings its own conventions with it.
 func skipFile(path, content string) bool {
-	if strings.HasSuffix(path, "_test.go") {
+	if lang.IsTest(path) {
 		return true
 	}
-	// A generated file carries the marker before its package clause; scan only
-	// that far so a stray "DO NOT EDIT" in real code doesn't false-positive.
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
+	return lang.IsGenerated(path, head(content, generatedHeadLines))
+}
+
+// head returns a file's leading comment block — the blank and comment lines
+// before the first line of actual code, capped at n lines.
+//
+// The cap alone would not be enough. Every generated-code convention puts its
+// marker in the opening banner, so that is the only place worth looking; a
+// "DO NOT EDIT" *in* the code (a warning on a hand-written constant, say) must
+// not condemn the file. The original Go-only rule expressed this as "before the
+// package clause"; this is the same rule without needing to know the language's
+// keyword for it.
+func head(s string, n int) string {
+	var b strings.Builder
+	sc := bufio.NewScanner(strings.NewReader(s))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for i := 0; i < n && sc.Scan(); i++ {
 		line := strings.TrimSpace(sc.Text())
-		if generatedMarker.MatchString(line) {
-			return true
-		}
-		if strings.HasPrefix(line, "package ") {
+		if line != "" && !isCommentLine(line) {
 			break
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// commentStarts are the line prefixes that open or continue a comment in the
+// languages descry indexes. Recognizing them by prefix keeps head language-
+// agnostic; a false negative only means a generated file gets indexed.
+var commentStarts = []string{"//", "#", "/*", "*/", "*", "--", ";", "<!--"}
+
+func isCommentLine(line string) bool {
+	for _, p := range commentStarts {
+		if strings.HasPrefix(line, p) {
+			return true
 		}
 	}
 	return false
@@ -187,13 +252,20 @@ func embedChunks(emb embed.Embedder, chunks []core.Chunk, progress func(done, to
 	wg.Wait()
 }
 
-// embedText is what the embedder actually sees for a chunk: the relative file
-// path as a header line, then the content. The path names the component in
-// words the model understands after WordPiece ("internal/search/bm25.go"), so
-// queries that name a file or subsystem land nearer its chunks — a measured
-// MRR gain (README "Retrieval"). Changing this changes stored vectors, so bump
+// embedText is what the embedder actually sees for a chunk.
+//
+// A chunker that builds an enriched representation (language, module path,
+// qualified symbol, signature — see core.Chunk.EmbedText) supplies it directly.
+// Otherwise the chunk gets the original treatment: the relative file path as a
+// header line, then the content. The path names the component in words the
+// model understands after WordPiece ("internal/search/bm25.go"), so queries
+// naming a file or subsystem land nearer its chunks — a measured MRR gain
+// (README "Retrieval"). Changing either form changes stored vectors, so bump
 // pipelineVersion when you do.
 func embedText(c core.Chunk) string {
+	if c.EmbedText != "" {
+		return c.EmbedText
+	}
 	if c.Path == "" {
 		return c.Content
 	}

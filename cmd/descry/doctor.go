@@ -18,7 +18,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/jKiler/descry/internal/chunk"
 	"github.com/jKiler/descry/internal/embed"
 	"github.com/jKiler/descry/internal/skill"
 	"github.com/jKiler/descry/internal/store"
@@ -127,7 +126,7 @@ func checkORT() check {
 
 // checkModel reports the selected MiniLM export and whether it is cached.
 func checkModel() check {
-	st, err := embed.LocateModel(os.Getenv("DESCRY_MODEL"))
+	st, err := embed.LocateModel(os.Getenv(modelEnv))
 	if err != nil {
 		return check{
 			mark:   markBad,
@@ -214,9 +213,16 @@ func staleFields(stored string) []string {
 	want := map[string]string{
 		"schema":   fmt.Sprint(store.SchemaVersion),
 		"pipeline": fmt.Sprint(pipelineVersion),
-		"chunker":  chunk.NewASTChunker().ID(),
 	}
-	if st, err := embed.LocateModel(os.Getenv("DESCRY_MODEL")); err == nil {
+	// selectChunker, not a named strategy and not chunk.Default: doctor reports
+	// whether the index matches what *this invocation's* pipeline would build.
+	// Hardcoding a name tells every user their index is stale the day the default
+	// changes; ignoring $DESCRY_CHUNKER tells the opposite lie to anyone running a
+	// non-default arm — that a deliberately different index is the expected one.
+	if chk, err := selectChunker(); err == nil {
+		want["chunker"] = chk.ID()
+	}
+	if st, err := embed.LocateModel(os.Getenv(modelEnv)); err == nil {
 		want["embedder"] = st.ID
 	}
 	var stale []string
